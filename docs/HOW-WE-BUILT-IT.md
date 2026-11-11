@@ -93,6 +93,17 @@ came back to the group. We added a log line for group messages that arrive but
 aren't addressed to the bot, so you can tell "Telegram isn't delivering" apart from "the
 relay is ignoring it."
 
+### Admins and members: a hard boundary, not a polite prompt
+
+Once other people could talk to the bot, the owner wanted them able to chat but not to drive
+the agent: no shell, no files, no routines, no settings. The first idea was to route members
+to a second, "restricted" Grok Bot. We dropped it: agents on the same host share a machine
+with shell access, so a restricted agent is not a sandbox. Instead, members never reach any
+agent. The relay answers them itself with one plain chat-completion call that sends no tools,
+and only admins' messages go to the webhook. New pairings default to member, only admins can
+approve, promote, or demote, and the old allowlist migrated with its first entry (the owner)
+as admin.
+
 ## What we'd do next
 
 See the roadmap in [docs/SETUP.md](SETUP.md#roadmap-ideas): an opt-in all-messages

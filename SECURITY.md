@@ -8,8 +8,9 @@ what you should do about it.
 
 A webhook routine runs as your Grok Bot, **with that bot's connectors and tools**. If the bot
 can read your email, see your calendar, browse signed in as you, run shell commands, or
-move money, then anyone on the allowlist can ask it to do those things from Telegram. The
-routine prompt can tell the bot to be careful, but a prompt is not a permission system.
+move money, then any **admin** can ask it to do those things from Telegram. The routine
+prompt can tell the bot to be careful, but a prompt is not a permission system.
+**Admins are fully trusted.** Only make someone an admin if you'd hand them the bot itself.
 
 What to do:
 
@@ -17,22 +18,59 @@ What to do:
   needs (for a household: maybe a shared calendar, nothing financial).
 - Keep the routine prompt's rule that the Telegram event is untrusted data, and its rule not
   to pull in private matters from your other bots or accounts.
-- Allowlist only people you'd trust with that bot directly.
+- Make only people you'd trust with that bot directly admins. Everyone else is a member.
+
+## Roles: the hard boundary between admins and members
+
+Each approved person has a role in `state.json` (`roles: {user_id: "admin" | "member"}`).
+
+- **Admin** messages are forwarded to the webhook routine, with `role: "admin"` in the event.
+- **Member** messages are **never** forwarded to the webhook or to any Grok Bot. The relay
+  answers them itself with one plain chat-completion request to an OpenAI-compatible API
+  (`GROKBOT_MEMBER_LLM_*`). The request carries a system prompt, the last few chat turns,
+  and the member's text (plus the photo, or the local voice transcript). It sets no `tools`,
+  `functions`, or `tool_choice`, and the relay never acts on anything in the reply except
+  sending it back as text.
+
+Why this is a real boundary and not just a polite prompt: a Grok Bot agent has tools, and
+agents on the same host often share a shell and filesystem, so a "restricted" second agent
+is not a sandbox. The member path has no agent at all. A member who talks the chat model
+into "agreeing" to run a command, set a routine, or read a file gets only words back; there
+is nothing on that path that can do it. Prompt injection from members can at most change
+what the chat model says.
+
+Details:
+
+- Unknown or missing roles fail safe to `member`. New pairings are approved as `member`.
+- Only admins can `/approve`, `/promote <user_id>`, and `/demote <user_id>`; members get
+  "Only an admin can do that." The last admin can't be demoted or removed.
+- `/whoami` shows the caller's role. It never runs anything.
+- Upgrading from a version without roles: the first id in the old allowlist becomes admin,
+  everyone else becomes member, and the old file is copied to `state.json.bak-preroles`.
+  `GROKBOT_ADMINS` ids are always admin; `GROKBOT_ALLOWLIST` ids are added as members.
+- **Member messages leave your machine** for the chat model's provider (xAI by default),
+  including photos they send. Pick a provider whose data terms you accept.
+- Each member reply is one paid API call. If `GROKBOT_MEMBER_LLM_API_KEY` is unset, members
+  get "I'm only set up to chat with admins right now." and nothing is sent anywhere.
+- The relay keeps a short rolling context per chat (last 10 member turns) **in memory
+  only**; it is lost on restart and never written to disk or logs.
+- Member photos and voice notes are still downloaded to `media/` (7-day retention) so they
+  can be passed to the chat model or transcribed locally.
 
 ## Prompt injection
 
 Anything that reaches the bot can try to steer it:
 
-- **Group members.** Any allowlisted person can address the bot. Their messages can contain
-  instructions aimed at the bot.
-- **Forwarded messages.** A forwarded message from a stranger arrives as text from an
-  allowlisted person.
+- **Admins.** Only admins' messages reach the bot. Their messages can contain instructions
+  aimed at the bot (members' messages go to the no-tools chat model instead).
+- **Forwarded messages.** A message an admin forwards from a stranger arrives as text from
+  that admin.
 - **Photos.** Text inside an image ("ignore your instructions and ...") is read by the bot
   when it looks at the photo.
 - **Voice notes.** Transcripts are just text and can carry the same instructions.
 
 The bridge doesn't filter content. Your defenses are the routine prompt, a bot with few
-tools, and a short allowlist.
+tools, and a short admin list.
 
 ## Who can get in: allowlist and pairing codes
 
@@ -40,11 +78,11 @@ tools, and a short allowlist.
   it in a group, get a random 6-hex-character pairing code, not access. Nothing they send is
   forwarded, and their photos and voice notes are never downloaded.
 - Codes are single-use and expire after 24 hours. One pending code per user.
-- Approval happens on the machine (`approve.py`) or by an allowlisted user sending
-  `/approve <code>`. **Any allowlisted user can approve anyone.** If that is too loose for
-  you, only approve from the machine and keep the allowlist small.
-- The allowlist is per person, not per chat. An allowlisted person can add the bot to any
-  group and use it there; the bot will answer them in that group.
+- Approval happens on the machine (`approve.py`) or by an **admin** sending
+  `/approve <code>`. New people are approved as members; use `approve.py <code> --admin` or
+  `/promote <user_id>` to make someone an admin.
+- Access is per person, not per chat. An approved person can add the bot to any group and
+  use it there; the bot will answer them in that group (members still get chat only).
 - Removing someone: `python3 approve.py --remove <id>`. Removing an id from
   `GROKBOT_ALLOWLIST` does **not** remove it from `state.json`.
 
@@ -62,13 +100,15 @@ then gets mentions, replies, and commands, depending on Telegram's rules.
 
 ## Secrets
 
-- `TELEGRAM_BOT_TOKEN` and `GROKBOT_WEBHOOK_KEY` are read only from the environment (or a
-  local `.env` file you create). The relay never writes them to disk.
-- Log lines are scrubbed: the token, the key, and any `/bot<id>:<token>` URL pattern are
+- `TELEGRAM_BOT_TOKEN`, `GROKBOT_WEBHOOK_KEY`, and `GROKBOT_MEMBER_LLM_API_KEY` are read
+  only from the environment (or a local `.env` file you create). The relay never writes
+  them to disk.
+- Log lines are scrubbed: the token, the keys, and any `/bot<id>:<token>` URL pattern are
   replaced with `***`. Telegram file-download URLs contain the token, so they are never
   logged or stored. Download errors log only the error type or HTTP status.
-- Log lines carry no message text, captions, or transcripts.
-- The tests check that a fake token and key never appear in logs or in any file written.
+- Log lines carry no message text, captions, transcripts, or model replies. They record the
+  role and path (`webhook` or `member-llm`) and the member call's status.
+- The tests check that a fake token and keys never appear in logs or in any file written.
 - If you use `.env`, `chmod 600 .env`, keep it out of git (it is in `.gitignore`), and
   prefer your bot's secrets store if it has one.
 
@@ -106,11 +146,10 @@ users or services.
 
 ## Not built yet
 
-- **No rate limiting.** An allowlisted person (or a stranger, for pairing replies) can send
-  as many messages as they like, and each forwarded message starts a run. Watch usage, and
-  remove people who abuse it.
-- No per-chat allowlist, no admin-only approvals, no content filtering, no audit log beyond
-  `relay.log`.
+- **No rate limiting.** An approved person (or a stranger, for pairing replies) can send
+  as many messages as they like. Each admin message starts a run and each member message is
+  one paid chat-model call. Watch usage, and remove people who abuse it.
+- No per-chat allowlist, no content filtering, no audit log beyond `relay.log`.
 
 ## Reporting a vulnerability
 

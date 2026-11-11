@@ -7,7 +7,7 @@ transcriber.py (faster-whisper in a separate venv) in a long-lived subprocess.
 Configuration comes from environment variables (see .env.example).
 Secrets come only from the environment; nothing secret is logged or saved.
 """
-import fcntl, json, os, re, secrets, select, shutil, subprocess, sys, threading, time, urllib.error, urllib.request
+import base64, collections, fcntl, json, os, re, secrets, select, shutil, subprocess, sys, threading, time, urllib.error, urllib.request
 from contextlib import contextmanager
 
 CODE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -70,15 +70,42 @@ def configure_paths():
 def log(msg):
     tok = os.environ.get("TELEGRAM_BOT_TOKEN")
     key = os.environ.get("GROKBOT_WEBHOOK_KEY")
-    for s in (tok, key):
+    for s in (tok, key, member_llm_key()):
         if s:
             msg = msg.replace(s, "***")
     msg = _BOT_URL_RE.sub("/bot***", msg)
     print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
 
 # ---------- state (shared with approve.py via a file lock) ----------
+ROLES = ("admin", "member")
+
 def _blank():
-    return {"offset": 0, "allowlist": [], "pending": {}}
+    return {"offset": 0, "allowlist": [], "roles": {}, "pending": {}}
+
+def _migrate_roles(s):
+    """Pre-roles state had only an allowlist (everyone fully trusted). Make the first
+    allowlisted id (the owner, who paired first) admin and everyone else member.
+    A one-time copy of the old file is kept as state.json.bak-preroles."""
+    if "roles" in s:
+        return False
+    if os.path.exists(STATE) and not os.path.exists(STATE + ".bak-preroles"):
+        shutil.copy2(STATE, STATE + ".bak-preroles")
+    al = s.get("allowlist") or []
+    s["roles"] = {str(u): ("admin" if i == 0 else "member") for i, u in enumerate(al)}
+    return True
+
+def _sync(s):
+    """Keep allowlist == ids that have a role (roles is the source of truth)."""
+    for u in s["allowlist"]:
+        s["roles"].setdefault(str(u), "member")
+    s["allowlist"] = sorted(int(u) for u in s["roles"])
+
+def role_of(s, uid):
+    """'admin', 'member', or None (not approved). Unknown values fail safe to member."""
+    r = s["roles"].get(str(uid))
+    if r is None:
+        return None
+    return r if r in ROLES else "member"
 
 @contextmanager
 def state(write=True):
@@ -89,50 +116,92 @@ def state(write=True):
                 s = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
             s = _blank()
+        migrated = _migrate_roles(s)
         for k, v in _blank().items():
             s.setdefault(k, v)
+        _sync(s)
+        if migrated:
+            write = True
+            log("state migrated to roles: " + " ".join(f"{u}={r}" for u, r in s["roles"].items()))
         now = time.time()
         s["pending"] = {c: p for c, p in s["pending"].items() if now - p.get("created", 0) < CODE_TTL}
         yield s
+        _sync(s)
         if write:
             tmp = STATE + ".tmp"
             with open(tmp, "w") as f:
                 json.dump(s, f, indent=2)
             os.replace(tmp, STATE)
 
-def parse_allowlist(raw):
-    """Parse GROKBOT_ALLOWLIST: comma/space separated numeric Telegram user ids."""
+def parse_allowlist(raw, var="GROKBOT_ALLOWLIST"):
+    """Parse a comma/space separated list of numeric Telegram user ids."""
     ids = []
     for part in re.split(r"[,\s]+", raw or ""):
         if part:
             try:
                 ids.append(int(part))
             except ValueError:
-                raise SystemExit(f"GROKBOT_ALLOWLIST: not a numeric user id: {part!r}")
+                raise SystemExit(f"{var}: not a numeric user id: {part!r}")
     return ids
 
-def seed_allowlist(raw=None):
-    """Add ids from GROKBOT_ALLOWLIST to the saved allowlist (never removes anyone)."""
+def seed_allowlist(raw=None, admins_raw=None):
+    """Seed users from the environment (never removes anyone, never demotes anyone).
+    GROKBOT_ADMINS ids become admin; GROKBOT_ALLOWLIST ids are added as member."""
+    admins = parse_allowlist(os.environ.get("GROKBOT_ADMINS") if admins_raw is None else admins_raw,
+                             "GROKBOT_ADMINS")
     ids = parse_allowlist(os.environ.get("GROKBOT_ALLOWLIST") if raw is None else raw)
-    if not ids:
+    if not ids and not admins:
         return 0
     added = 0
     with state() as s:
+        for uid in admins:
+            if role_of(s, uid) != "admin":
+                s["roles"][str(uid)] = "admin"; added += 1
         for uid in ids:
-            if uid not in s["allowlist"]:
-                s["allowlist"].append(uid); added += 1
+            if role_of(s, uid) is None:
+                s["roles"][str(uid)] = "member"; added += 1
+        no_admin = "admin" not in s["roles"].values()
     if added:
-        log(f"allowlist seeded with {added} id(s) from GROKBOT_ALLOWLIST")
+        log(f"seeded {added} user role(s) from GROKBOT_ADMINS / GROKBOT_ALLOWLIST")
+    if no_admin and s["roles"]:
+        log("warning: no admin configured; nobody's messages reach the webhook. "
+            "Set GROKBOT_ADMINS or run: python3 approve.py --role <user_id> admin")
     return added
 
-def approve_code(code):
-    """Move a pending code's user into the allowlist. Returns user dict or None."""
+def approve_code(code, role="member"):
+    """Approve a pending code's user with a role (default member; an existing role is only
+    changed if role is given explicitly as admin). Returns the pending dict or None."""
+    assert role in ROLES
     code = code.strip().upper()
     with state() as s:
         p = s["pending"].pop(code, None)
-        if p and p["user_id"] not in s["allowlist"]:
-            s["allowlist"].append(p["user_id"])
+        if p:
+            cur = role_of(s, p["user_id"])
+            s["roles"][str(p["user_id"])] = "admin" if "admin" in (cur, role) else "member"
+            p["role"] = s["roles"][str(p["user_id"])]
         return p
+
+def set_role(uid, role):
+    """Set an approved user's role. Returns (ok, message). Refuses to remove the last admin."""
+    assert role in ROLES
+    with state() as s:
+        cur = role_of(s, uid)
+        if cur is None:
+            return False, f"User {uid} isn't approved yet. Approve their pairing code first."
+        if cur == role:
+            return True, f"User {uid} is already {role}."
+        if cur == "admin" and sum(1 for r in s["roles"].values() if r == "admin") <= 1:
+            return False, "Can't demote the last admin."
+        s["roles"][str(uid)] = role
+        return True, f"User {uid} is now {role}."
+
+def remove_user(uid):
+    with state() as s:
+        if role_of(s, uid) == "admin" and sum(1 for r in s["roles"].values() if r == "admin") <= 1:
+            return False
+        s["roles"].pop(str(uid), None)
+        s["allowlist"] = [u for u in s["allowlist"] if u != uid]
+        return True
 
 # ---------- Telegram API ----------
 class TgError(Exception):
@@ -351,6 +420,108 @@ def forward(event):
         time.sleep(2 ** attempt)
     return False
 
+# ---------- member chat (hard sandbox) ----------
+# Members never reach the Grok Bot webhook (that agent has tools and a shell). Their messages
+# go to a plain chat-completion call: no tools, no function calling, no files, no shell.
+MEMBER_HISTORY_MAX = 10
+MEMBER_HISTORY = collections.defaultdict(lambda: collections.deque(maxlen=MEMBER_HISTORY_MAX))
+MEMBER_HISTORY_LOCK = threading.Lock()
+MEMBER_THREADED = True          # tests set False to run replies inline
+VISION_MIME = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png"}
+NO_KEY_REPLY = "I'm only set up to chat with admins right now."
+LLM_FAIL_REPLY = "Sorry, I couldn't come up with a reply just now. Please try again in a bit."
+ADMIN_ONLY_REPLY = "Only an admin can do that."
+
+def _menv(suffix, default=None):
+    return os.environ.get("GROKBOT_MEMBER_LLM_" + suffix) or default
+
+def member_llm_key():
+    return _menv("API_KEY")
+
+def member_llm_config():
+    return {"base_url": _menv("BASE_URL", "https://api.x.ai/v1").rstrip("/"),
+            "model": _menv("MODEL", "grok-4.3"),
+            "key": member_llm_key(),
+            "timeout": float(_menv("TIMEOUT", "60")),
+            "vision": (_menv("VISION", "1") or "1").lower() not in ("0", "false", "no", "off")}
+
+def MEMBER_BOT_NAME():
+    return os.environ.get("GROKBOT_BOT_NAME") or "the household assistant"
+
+def member_system_prompt():
+    name = MEMBER_BOT_NAME()
+    return (f"You are {name}, a friendly household assistant chatting in Telegram with family and "
+            "friends. In this conversation you can only talk: answer questions, brainstorm, explain, "
+            "help with wording, and keep people company. You cannot take any actions. You can't run "
+            "commands or programs, open or read files, access anyone's accounts, email, calendar or "
+            "devices, browse the web, buy anything, or set reminders, timers, schedules or routines. "
+            "If someone asks for any of that, say kindly that you can't do it from this chat and "
+            "suggest they ask the bot's admin. Never pretend you did something. You may not know "
+            "recent events. Several people may be in the chat; user messages start with the "
+            "sender's first name. Keep replies short and warm, plain text, no markdown headings.")
+
+def _post_chat(cfg, payload):
+    req = urllib.request.Request(cfg["base_url"] + "/chat/completions", data=json.dumps(payload).encode(),
+        method="POST", headers={"Content-Type": "application/json",
+                                "Authorization": f"Bearer {cfg['key']}"})
+    with urllib.request.urlopen(req, timeout=cfg["timeout"]) as r:
+        return json.loads(r.read())
+
+def member_reply_text(chat_id, first_name, text, image_path=None):
+    """Return (reply, status). Never raises. Only text in, text out; no tools are offered."""
+    cfg = member_llm_config()
+    if not cfg["key"]:
+        return NO_KEY_REPLY, "no-key"
+    who = (first_name or "Someone").strip()[:40]
+    turn = f"{who}: {text}" if text else f"{who}: (no text)"
+    with MEMBER_HISTORY_LOCK:
+        history = list(MEMBER_HISTORY[chat_id])
+    content = turn
+    if image_path and cfg["vision"]:
+        mime = VISION_MIME.get(os.path.splitext(image_path)[1].lower())
+        if mime:
+            with open(image_path, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode()
+            content = [{"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+                       {"type": "text", "text": turn}]
+    messages = [{"role": "system", "content": member_system_prompt()}] + history + \
+               [{"role": "user", "content": content}]
+    payload = {"model": cfg["model"], "messages": messages, "stream": False, "max_tokens": 800}
+    try:
+        body = _post_chat(cfg, payload)
+        reply = (body["choices"][0]["message"].get("content") or "").strip()
+        if not reply:
+            raise ValueError("empty reply")
+    except urllib.error.HTTPError as e:
+        return LLM_FAIL_REPLY, f"http-{e.code}"
+    except Exception as e:
+        return LLM_FAIL_REPLY, type(e).__name__
+    with MEMBER_HISTORY_LOCK:
+        h = MEMBER_HISTORY[chat_id]
+        h.append({"role": "user", "content": turn if not image_path else f"{who}: [sent a photo] {text}".rstrip()})
+        h.append({"role": "assistant", "content": reply[:4000]})
+    return reply, "ok"
+
+def _member_job(upd_id, chat_id, mid, first_name, text, image_path, name):
+    t0 = time.time()
+    try:
+        reply, status = member_reply_text(chat_id, first_name, text, image_path)
+        try:
+            send_text(chat_id, reply, mid)
+        except TgError as e:
+            status += f" send-failed:{e.status}"
+        log(f"member reply update_id={upd_id} path=member-llm status={status} chars={len(reply)} secs={time.time() - t0:.1f}")
+    except Exception as e:
+        log(f"member reply error update_id={upd_id}: {type(e).__name__}")
+    finally:
+        typing_stop(name)
+
+def run_member_job(*args):
+    if MEMBER_THREADED:
+        threading.Thread(target=_member_job, args=args, daemon=True).start()
+    else:
+        _member_job(*args)
+
 # ---------- inbound handling ----------
 class Bot:
     def __init__(self):
@@ -402,22 +573,42 @@ class Bot:
             log(f"update_id={upd['update_id']} user_id={uid} chat_type={ctype} not addressed; ignored")
             return
         with state(write=False) as s:
-            allowed = uid in s["allowlist"]
+            role = role_of(s, uid)
+        allowed = role is not None
         kind = media["kind"] if media else "text"
-        log(f"update_id={upd['update_id']} user_id={uid} chat_type={ctype} kind={kind} allowed={allowed}")
+        log(f"update_id={upd['update_id']} user_id={uid} chat_type={ctype} kind={kind} allowed={allowed} role={role}")
         if not allowed:
             self.pairing_reply(msg, user)
             return
+        mid = msg.get("message_id")
         cmd = text.strip().split() if not media else []
-        if cmd and cmd[0].split("@")[0].lower() == "/approve":
-            p = approve_code(cmd[1]) if len(cmd) > 1 else None
-            send_text(chat["id"], f"Approved user {p['user_id']}." if p else
-                      "Usage: /approve <code> (code unknown or expired)", msg.get("message_id"))
-            if p:
-                log(f"approved user_id={p['user_id']} by user_id={uid}")
+        verb = cmd[0].split("@")[0].lower() if cmd else ""
+        if verb in ("/approve", "/promote", "/demote"):
+            if role != "admin":
+                log(f"update_id={upd['update_id']} user_id={uid} role={role} command={verb} denied")
+                send_text(chat["id"], ADMIN_ONLY_REPLY, mid)
+                return
+            if verb == "/approve":
+                p = approve_code(cmd[1]) if len(cmd) > 1 else None
+                send_text(chat["id"], f"Approved user {p['user_id']} as {p['role']}." if p else
+                          "Usage: /approve <code> (code unknown or expired)", mid)
+                if p:
+                    log(f"approved user_id={p['user_id']} role={p['role']} by user_id={uid}")
+                return
+            target = cmd[1] if len(cmd) > 1 else ""
+            if not re.fullmatch(r"-?[0-9]+", target):
+                send_text(chat["id"], f"Usage: {verb} <user_id>", mid)
+                return
+            new = "admin" if verb == "/promote" else "member"
+            ok, note = set_role(int(target), new)
+            send_text(chat["id"], note, mid)
+            log(f"{verb[1:]} user_id={target} ok={ok} by user_id={uid}")
             return
-        if cmd and cmd[0].split("@")[0].lower() == "/whoami":
-            send_text(chat["id"], f"user_id={uid} chat_id={chat['id']}", msg.get("message_id"))
+        if verb == "/whoami":
+            send_text(chat["id"], f"user_id={uid} chat_id={chat['id']} role={role}", mid)
+            return
+        if role != "admin":
+            self.handle_member(upd, msg, user, chat, text, media, kind)
             return
         event = {"source": "telegram", "update_id": upd["update_id"],
                  "chat_id": chat["id"], "chat_type": ctype, "chat_title": chat.get("title"),
@@ -425,17 +616,40 @@ class Bot:
                  "username": user.get("username"), "first_name": user.get("first_name"),
                  "text": text, "date": msg.get("date"),
                  "reply_file": os.path.join(OUTBOX, f"{upd['update_id']}.json"),
-                 "kind": kind, "media_path": None, "transcript": None}
+                 "kind": kind, "media_path": None, "transcript": None, "role": "admin"}
         name = f"{upd['update_id']}.json"
         typing_start(name, chat["id"])
         if media and not self.prepare_media(upd, msg, media, event):
             typing_stop(name)
             return
+        log(f"update_id={upd['update_id']} role=admin path=webhook")
         ok = forward(event)
         if not ok:
             typing_stop(name)
         if not ok and webhook_config() is None:
             send_text(chat["id"], f"{BOT_NAME} isn't connected yet. Try again later.", msg.get("message_id"))
+
+    def handle_member(self, upd, msg, user, chat, text, media, kind):
+        """Members never reach the webhook. The relay answers them itself (chat only)."""
+        uidd, mid = upd["update_id"], msg.get("message_id")
+        log(f"update_id={uidd} role=member path=member-llm kind={kind}")
+        name = f"member-{uidd}"
+        typing_start(name, chat["id"])
+        image_path = None
+        if media:
+            ev = {"text": text}
+            if not self.prepare_media(upd, msg, media, ev):
+                typing_stop(name)
+                return
+            if media["kind"] == "photo":
+                image_path = ev["media_path"]
+                if not (member_llm_config()["vision"] and
+                        VISION_MIME.get(os.path.splitext(image_path)[1].lower())):
+                    text = "[sent a photo I can't view]" + (f" {text}" if text else "")
+                    image_path = None
+            else:
+                text = ev["text"].replace("; the audio file is at media_path", "")
+        run_member_job(uidd, chat["id"], mid, user.get("first_name"), text, image_path, name)
 
     def prepare_media(self, upd, msg, media, event):
         """Download (and for voice, transcribe) the attachment into event. False = stop."""
@@ -606,7 +820,8 @@ def main():
         except TgError as e:
             log(f"getMe failed: {e}; retrying in 30s")
             time.sleep(30)
-    log(f"started as @{bot.username} id={bot.id}; webhook configured={bool(webhook_config())}")
+    log(f"started as @{bot.username} id={bot.id}; webhook configured={bool(webhook_config())}; "
+        f"member llm key set={bool(member_llm_key())} model={member_llm_config()['model']}")
     threading.Thread(target=outbox_loop, daemon=True).start()
     threading.Thread(target=typing_loop, daemon=True).start()
     bot.poll_forever()

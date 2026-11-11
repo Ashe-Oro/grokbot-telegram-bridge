@@ -83,6 +83,7 @@ The webhook body is one JSON object per Telegram message:
 | `transcript` | Voice only: the transcript, or `null` if transcription failed |
 | `media_mime`, `media_size` | Media only |
 | `media_duration`, `voice_source`, `transcript_error` | Voice only |
+| `role` | Always `"admin"`. Members are answered by the relay's no-tools chat call and never reach this routine. |
 
 ## What the bot writes
 
@@ -97,7 +98,7 @@ Write `<reply_file>.tmp`, then rename it to `<reply_file>`.
 Any routine on the same bot can post to Telegram by dropping a file into the outbox. The file
 name only has to end in `.json`, so pick something unique such as
 `outbox/weekly-meal-plan-20261115.json`. Use the same write-then-rename step. You need the
-target `chat_id`; send `/whoami` in that chat (as an allowlisted user) to get it.
+target `chat_id`; send `/whoami` in that chat (as an approved user) to get it.
 
 Example scheduled routine prompt:
 

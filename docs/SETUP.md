@@ -42,7 +42,7 @@ sequenceDiagram
     R->>T: getUpdates (long poll, 25s)
     U->>T: message, photo, or voice note
     T-->>R: update
-    Note over R: allowlist check, group mention check,<br/>download media, transcribe voice
+    Note over R: allowlist and role check, group mention check,<br/>download media, transcribe voice<br/>(members are answered by the relay's no-tools chat call instead)
     R->>G: POST event JSON<br/>Authorization: Bearer <webhook key>
     G-->>R: 200 (run started)
     Note over G: the bot reads the event, opens media_path,<br/>and decides what to say
@@ -55,8 +55,9 @@ sequenceDiagram
 
 - **Inbound:** `relay.py` long-polls Telegram's `getUpdates`. Nothing connects in to your
   machine.
-- **Forwarding:** each message from an allowlisted user becomes one webhook POST, which
-  starts one run of your routine. A 200 only means the run started. The reply comes later.
+- **Forwarding:** each message from an **admin** becomes one webhook POST, which starts one
+  run of your routine. Members' messages are never forwarded; see
+  [Roles](#roles-admins-and-members). A 200 only means the run started. The reply comes later.
 - **Outbound:** the bot writes a small JSON file into `outbox/`. The relay sends it with
   `sendMessage` and deletes it. That is why the bridge and the bot must share a filesystem
   (see [Limitations](#limitations)).
@@ -110,8 +111,14 @@ win over it. See [.env.example](../.env.example) for the full list:
 | `TELEGRAM_BOT_TOKEN` | yes | BotFather token |
 | `GROKBOT_WEBHOOK_URL` | to forward | The routine's webhook URL |
 | `GROKBOT_WEBHOOK_KEY` | to forward | Sent as `Authorization: Bearer <key>` |
-| `GROKBOT_ALLOWLIST` | no | Telegram user ids allowed from the start (comma separated) |
-| `GROKBOT_BOT_NAME` | no | Name in the "isn't connected yet" reply |
+| `GROKBOT_ADMINS` | no | Telegram user ids that are admins (comma separated). Put your own id here |
+| `GROKBOT_ALLOWLIST` | no | Telegram user ids added as members from the start (comma separated) |
+| `GROKBOT_MEMBER_LLM_API_KEY` | for members | API key for the members' chat model. Unset: members get "I'm only set up to chat with admins right now." |
+| `GROKBOT_MEMBER_LLM_BASE_URL` | no | OpenAI-compatible base URL (default `https://api.x.ai/v1`) |
+| `GROKBOT_MEMBER_LLM_MODEL` | no | Chat model (default `grok-4.3`, text and image input) |
+| `GROKBOT_MEMBER_LLM_TIMEOUT` | no | Seconds per member reply (default 60) |
+| `GROKBOT_MEMBER_LLM_VISION` | no | `1` (default) sends member photos (JPEG/PNG) to the model; `0` sends only the caption |
+| `GROKBOT_BOT_NAME` | no | Name in the "isn't connected yet" reply and the members' chat persona |
 | `GROKBOT_DATA_DIR` | no | Where state, outbox, media, and logs live (default: this folder) |
 | `GROKBOT_ASR_PYTHON` | no | Python in the faster-whisper venv (default `./.venv-asr/bin/python`) |
 | `GROKBOT_ASR_MODEL` | no | `base.en` (default) or e.g. `small` for multilingual |
@@ -151,18 +158,39 @@ Message the bot from Telegram. If you are not on the allowlist, it replies:
 Approve on the machine:
 
 ```bash
-python3 approve.py 3FA9C1        # adds that Telegram user to the allowlist
-python3 approve.py --list        # allowlist and pending codes
-python3 approve.py --add <id>    # allow a numeric Telegram user id directly
+python3 approve.py 3FA9C1                 # approve as member (the default)
+python3 approve.py 3FA9C1 --admin         # approve as admin (or: --role admin|member)
+python3 approve.py --list                 # users with roles, and pending codes
+python3 approve.py --add <id> [--admin]   # add a numeric Telegram user id directly
+python3 approve.py --role <id> admin      # change a role (admin|member)
 python3 approve.py --remove <id>
 ```
 
-Or, once you are allowlisted yourself, send `/approve 3FA9C1` to the bot in Telegram. Codes
-expire after 24 hours. `/whoami` replies with your user id and the chat id, which is handy
-for `GROKBOT_ALLOWLIST` and for proactive messages.
+Or, as an admin, send `/approve 3FA9C1` to the bot in Telegram (approves as member), then
+`/promote <user_id>` or `/demote <user_id>` if needed. Members who try these get "Only an
+admin can do that." Codes expire after 24 hours. `/whoami` replies with your user id, the
+chat id, and your role, which is handy for `GROKBOT_ADMINS` and for proactive messages.
 
-To bootstrap, either set your own id in `GROKBOT_ALLOWLIST`, or start the bridge, message
-the bot, and approve your own code with `approve.py`.
+To bootstrap, either set your own id in `GROKBOT_ADMINS`, or start the bridge, message the
+bot, and approve your own code with `python3 approve.py <CODE> --admin`.
+
+### Roles: admins and members
+
+| | Admin | Member |
+|---|---|---|
+| Messages go to | the Grok Bot webhook routine (full agent) | a plain chat-completion call made by the relay |
+| Tools, connectors, files, shell, routines, settings | whatever the bot has | **none** |
+| Photos | saved; path in the event | sent to the chat model (JPEG/PNG) |
+| Voice notes | transcribed locally; transcript in the event | transcribed locally; transcript sent as text |
+| `/approve`, `/promote`, `/demote` | yes | "Only an admin can do that." |
+
+Members never reach the webhook or any agent, so nothing they say can make the bot act. The
+member chat model gets a system prompt saying it can only chat, a rolling context of the
+last 10 turns in that chat (kept in memory only), and the new message prefixed with the
+sender's first name. It is told to say kindly that it can't take actions and to suggest
+asking an admin. Member messages are sent to the chat model's provider. The relay keeps
+showing "typing..." while the member reply is generated, and a timeout or API error gets a
+polite "try again" reply. Group rules are the same for both roles.
 
 ## The receiving bot's routine
 
@@ -172,7 +200,8 @@ version:
 
 **Event fields** (POST body): `source`, `update_id`, `chat_id`, `chat_type`, `chat_title`,
 `message_id`, `user_id`, `username`, `first_name`, `date`, `kind` (`text` / `photo` /
-`voice`), `text`, `reply_file`, `media_path`, `transcript`, and for media `media_mime`,
+`voice`), `text`, `reply_file`, `media_path`, `transcript`, `role` (always `admin`; members
+never reach the webhook), and for media `media_mime`,
 `media_size`, plus `media_duration`, `voice_source`, `transcript_error` for voice.
 
 **Reply contract:**
@@ -190,10 +219,12 @@ into several messages. A malformed file, or one Telegram rejects with a 4xx, mov
 
 - In a group or supergroup, the relay forwards a message only if it **@mentions the bot**
   (in text or a photo caption) or **replies to one of the bot's messages**, and only if the
-  sender is allowlisted. Everything else is ignored and never leaves the machine.
+  sender is approved. Admin messages go to the webhook; member messages go to the no-tools
+  chat model. Everything else is ignored and never leaves the machine.
 - An unknown person who mentions the bot gets a pairing code in the group.
-- DMs from allowlisted users are always forwarded.
-- Commands addressed as `/approve@YourBot` and `/whoami@YourBot` work in groups.
+- DMs from approved users are always answered (admins via the webhook, members via the chat model).
+- Commands addressed as `/approve@YourBot`, `/promote@YourBot`, `/demote@YourBot`, and
+  `/whoami@YourBot` work in groups.
 
 ## Photos and voice notes
 
@@ -223,7 +254,7 @@ same write-then-rename step, for example a Sunday meal-planning reminder to the 
 group. The name only needs to end in `.json`. See
 [examples/routine-prompt.md](../examples/routine-prompt.md#proactive-messages-from-other-routines).
 
-Taking commands already works: anything an allowlisted person says to the bot starts a run,
+Taking commands already works: anything an admin says to the bot starts a run,
 so "remind us every Sunday to plan meals" is something the bot can set up as its own
 scheduled routine. Routines that need a login or an approval will still need you.
 
@@ -235,7 +266,7 @@ scheduled routine. Routines that need a login or an approval will still need you
   Telegram's "typing..." every 4 seconds until the reply is sent or
   `GROKBOT_TYPING_MAX` seconds have passed (default 180).
 - Outbound HTTPS only (Telegram and the webhook). No inbound ports, no TLS certs.
-- State is `state.json` (update offset, allowlist, pending codes; no secrets), shared with
+- State is `state.json` (update offset, allowlist, roles, pending codes; no secrets), shared with
   `approve.py` through a file lock.
 - Logs (`relay.log`) carry update ids, user ids, chat types, kinds, sizes, and errors. They
   never carry tokens, keys, message text, captions, or transcripts.
@@ -270,14 +301,16 @@ python3 test_media.py
 
 Offline tests with a fake token: Telegram, file downloads, and the webhook are mocked. They
 need `ffmpeg` to generate fixtures. The voice tests also need the faster-whisper venv and
-are skipped without it. Every test also checks that no token or key reached the logs or any
-file on disk.
+are skipped without it. The role tests mock the chat-model HTTP call and check that member
+messages never reach the webhook. Every test also checks that no token or key reached the
+logs or any file on disk.
 
 ## Limitations
 
 - **Latency.** Each message starts a full agent run. Expect a few seconds to a minute per
   reply.
-- **Usage.** One message is one routine run. A chatty group can use a lot of your plan;
+- **Usage.** One admin message is one routine run; one member message is one chat-model
+  API call billed to `GROKBOT_MEMBER_LLM_API_KEY`. A chatty group can use a lot of your plan;
   keep an eye on usage.
 - **Text replies only.** The bot can't send photos or files back, edit messages, or react.
   Edited messages and reactions from users are ignored.

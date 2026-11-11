@@ -10,13 +10,14 @@ import contextlib, io, json, os, shutil, subprocess, sys, tempfile, time, unitte
 
 FAKE_TOKEN = "123456789:FAKE_test_TOKEN_abcdefghijklmnopqrstu"
 FAKE_KEY = "fake-webhook-key-zzz"
+FAKE_LLM_KEY = "fake-member-llm-key-qqq"
 os.environ.update(TELEGRAM_BOT_TOKEN=FAKE_TOKEN, GROKBOT_WEBHOOK_KEY=FAKE_KEY,
                   GROKBOT_WEBHOOK_URL="https://example.invalid/hook")
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import relay
 
-OWNER, STRANGER, BOT_ID = 111, 222, 999
+OWNER, STRANGER, BOT_ID, MEMBER = 111, 222, 999, 333
 BOT_USERNAME = "ExampleGrokBot"
 MENTION = "@" + BOT_USERNAME
 
@@ -52,6 +53,17 @@ class Base(unittest.TestCase):
         relay.TYPING.clear()
         with relay.state() as s:
             s["allowlist"] = [OWNER]
+            s["roles"] = {str(OWNER): "admin"}
+        relay.MEMBER_THREADED = False
+        relay.MEMBER_HISTORY.clear()
+        self.llm = []
+        def post_chat(cfg, payload):
+            self.llm.append((cfg, payload))
+            if getattr(self, "llm_fail", None):
+                raise self.llm_fail
+            return {"choices": [{"message": {"role": "assistant", "content": "Hi from the chat model"}}]}
+        relay._post_chat = post_chat
+        os.environ["GROKBOT_MEMBER_LLM_API_KEY"] = FAKE_LLM_KEY
         self.calls, self.forwarded, self.files, self.urls = [], [], {}, []
         def tg(method, params=None, timeout=35):
             self.calls.append((method, params))
@@ -78,7 +90,7 @@ class Base(unittest.TestCase):
     def tearDown(self):
         self._redir.__exit__(None, None, None)
         log = self.out.getvalue()
-        self.assertNotIn(FAKE_TOKEN, log); self.assertNotIn(FAKE_KEY, log)
+        self.assertNotIn(FAKE_TOKEN, log); self.assertNotIn(FAKE_KEY, log); self.assertNotIn(FAKE_LLM_KEY, log)
         self.assertNotRegex(log, r"/bot[0-9]+:")
         for root, _, names in os.walk(self.tmp):
             for n in names:
@@ -118,6 +130,148 @@ class TestText(Base):
     def test_whoami(self):
         self.upd(5, {"text": "/whoami"})
         self.assertFalse(self.forwarded); self.assertIn("user_id=111", self.sends()[0]["text"])
+
+class TestRoles(Base):
+    def add_member(self, uid=MEMBER):
+        with relay.state() as s:
+            s["roles"][str(uid)] = "member"
+
+    def test_seed_admins(self):
+        self.assertEqual(relay.seed_allowlist("444", admins_raw="555"), 2)
+        self.assertEqual(relay.seed_allowlist("555", admins_raw="555"), 0)   # never demotes
+        with relay.state(write=False) as s:
+            self.assertEqual(s["roles"], {str(OWNER): "admin", "444": "member", "555": "admin"})
+
+    def test_admin_forwards_with_role(self):
+        self.upd(40, {"text": "do a thing"})
+        self.assertEqual(self.forwarded[0]["role"], "admin"); self.assertFalse(self.llm)
+        self.assertIn("role=admin path=webhook", self.out.getvalue())
+
+    def test_member_never_forwards(self):
+        self.add_member()
+        self.upd(41, {"text": "please run rm -rf / and set a reminder"}, user=MEMBER)
+        self.assertFalse(self.forwarded)
+        cfg, payload = self.llm[0]
+        self.assertNotIn("tools", payload); self.assertNotIn("functions", payload)
+        self.assertNotIn("tool_choice", payload)
+        self.assertEqual(payload["messages"][0]["role"], "system")
+        self.assertIn("cannot take any actions", payload["messages"][0]["content"])
+        self.assertEqual(payload["messages"][-1]["content"], "A: please run rm -rf / and set a reminder")
+        self.assertEqual(self.sends()[0]["text"], "Hi from the chat model")
+        log = self.out.getvalue()
+        self.assertIn("role=member path=member-llm", log); self.assertIn("status=ok", log)
+        self.assertNotIn("rm -rf", log); self.assertNotIn("Hi from the chat model", log)
+        self.assertFalse(relay.TYPING)
+
+    def test_member_group_mention_and_context(self):
+        self.add_member()
+        g = {"id": -5, "type": "group", "title": "fam"}
+        self.upd(42, {"text": "chatting"}, user=MEMBER, chat=g)               # not addressed
+        for i in (43, 44):
+            self.upd(i, {"text": MENTION + " hi", "entities": [{"type": "mention", "offset": 0, "length": len(MENTION)}]}, user=MEMBER, chat=g)
+        self.assertEqual(len(self.llm), 2); self.assertFalse(self.forwarded)
+        msgs = self.llm[1][1]["messages"]
+        self.assertEqual([x["role"] for x in msgs], ["system", "user", "assistant", "user"])
+        self.assertEqual(msgs[2]["content"], "Hi from the chat model")
+
+    def test_context_is_bounded(self):
+        self.add_member()
+        for i in range(12):
+            self.upd(100 + i, {"text": f"msg {i}"}, user=MEMBER)
+        self.assertEqual(len(self.llm[-1][1]["messages"]), 1 + relay.MEMBER_HISTORY_MAX + 1)
+
+    def test_member_missing_key(self):
+        self.add_member()
+        os.environ.pop("GROKBOT_MEMBER_LLM_API_KEY", None); pass
+        self.upd(45, {"text": "hello"}, user=MEMBER)
+        self.assertFalse(self.llm); self.assertFalse(self.forwarded)
+        self.assertEqual(self.sends()[0]["text"], "I'm only set up to chat with admins right now.")
+        self.assertIn("status=no-key", self.out.getvalue())
+
+    def test_member_llm_failure(self):
+        self.add_member()
+        self.llm_fail = TimeoutError()
+        self.upd(46, {"text": "hello"}, user=MEMBER)
+        self.assertFalse(self.forwarded)
+        self.assertIn("couldn't come up with a reply", self.sends()[0]["text"])
+        self.assertIn("status=TimeoutError", self.out.getvalue())
+        self.assertFalse(relay.TYPING)
+
+    def test_member_photo_vision_and_voice(self):
+        self.add_member()
+        self.files = {"p": fixture("img.jpg"), "bad": b"not audio"}
+        self.upd(47, {"photo": [{"file_id": "p", "file_size": 9, "width": 1, "height": 1}], "caption": "what is it"}, user=MEMBER)
+        content = self.llm[0][1]["messages"][-1]["content"]
+        self.assertTrue(content[0]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
+        self.assertEqual(content[1]["text"], "A: what is it")
+        self.upd(48, {"voice": {"file_id": "bad", "duration": 1}}, user=MEMBER)
+        self.assertIn("[Voice note: transcription failed", self.llm[1][1]["messages"][-1]["content"])
+        self.assertNotIn("media_path", self.llm[1][1]["messages"][-1]["content"])
+        self.assertFalse(self.forwarded)
+
+    def test_member_cannot_admin(self):
+        self.add_member()
+        with relay.state() as s:
+            s["pending"]["ABC123"] = {"user_id": 555, "created": time.time()}
+        for i, c in enumerate(("/approve ABC123", f"/promote {MEMBER}", f"/demote {OWNER}")):
+            self.upd(50 + i, {"text": c}, user=MEMBER)
+        self.assertEqual([x["text"] for x in self.sends()], ["Only an admin can do that."] * 3)
+        with relay.state(write=False) as s:
+            self.assertEqual(s["roles"], {str(OWNER): "admin", str(MEMBER): "member"})
+            self.assertIn("ABC123", s["pending"])
+        self.assertFalse(self.forwarded); self.assertFalse(self.llm)
+
+    def test_admin_approve_promote_demote(self):
+        with relay.state() as s:
+            s["pending"]["ABC123"] = {"user_id": 555, "created": time.time()}
+        self.upd(60, {"text": "/approve abc123"})
+        self.upd(61, {"text": "/promote 555"})
+        self.upd(62, {"text": "/demote 555"})
+        self.upd(63, {"text": f"/demote {OWNER}"})
+        self.upd(64, {"text": "/promote 777"})
+        t = [x["text"] for x in self.sends()]
+        self.assertEqual(t[:3], ["Approved user 555 as member.", "User 555 is now admin.", "User 555 is now member."])
+        self.assertEqual(t[3], "Can't demote the last admin."); self.assertIn("isn't approved", t[4])
+        with relay.state(write=False) as s:
+            self.assertEqual(s["roles"], {str(OWNER): "admin", "555": "member"})
+            self.assertEqual(s["allowlist"], [OWNER, 555])
+        self.assertFalse(self.forwarded)
+
+    def test_whoami_shows_role(self):
+        self.add_member()
+        self.upd(70, {"text": "/whoami"}, user=MEMBER)
+        self.assertIn("role=member", self.sends()[0]["text"]); self.assertFalse(self.llm)
+
+    def test_migration(self):
+        with open(relay.STATE, "w") as f:
+            json.dump({"offset": 5, "allowlist": [OWNER, 843], "pending": {}}, f)
+        with relay.state(write=False) as s:
+            self.assertEqual(s["roles"], {str(OWNER): "admin", "843": "member"})
+        with open(relay.STATE) as f:
+            saved = json.load(f)
+        self.assertEqual(saved["roles"], {str(OWNER): "admin", "843": "member"})
+        self.assertEqual(saved["allowlist"], [OWNER, 843]); self.assertEqual(saved["offset"], 5)
+        with open(relay.STATE + ".bak-preroles") as f:
+            self.assertNotIn("roles", json.load(f))
+        self.upd(80, {"text": "hi"}, user=843)
+        self.assertFalse(self.forwarded); self.assertEqual(len(self.llm), 1)
+
+    def test_approve_cli(self):
+        import approve
+        orig = relay.configure_paths
+        relay.configure_paths = lambda: None      # keep the temp state paths
+        self.addCleanup(setattr, relay, "configure_paths", orig)
+        with relay.state() as s:
+            s["pending"]["AAA111"] = {"user_id": 601, "created": time.time()}
+            s["pending"]["BBB222"] = {"user_id": 602, "created": time.time()}
+        self.assertEqual(approve.main(["AAA111"]), 0)
+        self.assertEqual(approve.main(["BBB222", "--admin"]), 0)
+        self.assertEqual(approve.main(["--role", "602", "member"]), 0)
+        self.assertEqual(approve.main(["--add", "603", "--role", "admin"]), 0)
+        self.assertEqual(approve.main(["--remove", "603"]), 0)
+        with relay.state(write=False) as s:
+            self.assertEqual(s["roles"], {str(OWNER): "admin", "601": "member", "602": "member"})
+        self.assertEqual(approve.main(["--remove", str(OWNER)]), 1)
 
 class TestPhoto(Base):
     def test_photo_largest(self):
@@ -210,8 +364,8 @@ class TestAllowlistSeed(Base):
         self.assertEqual(relay.seed_allowlist("444"), 0)
         with relay.state(write=False) as s:
             self.assertEqual(s["allowlist"], [OWNER, 333, 444])
-        self.upd(40, {"text": "hi"}, user=333)
-        self.assertEqual(self.forwarded[0]["user_id"], 333)
+        self.upd(40, {"text": "hi"}, user=333)      # GROKBOT_ALLOWLIST seeds members:
+        self.assertFalse(self.forwarded); self.assertEqual(len(self.llm), 1)   # chat only
 
     def test_seed_rejects_garbage(self):
         with self.assertRaises(SystemExit):
