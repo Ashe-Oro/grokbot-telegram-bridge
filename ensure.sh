@@ -2,6 +2,7 @@
 # Idempotent health check: starts the bridge if it is not running.
 # Safe to run from cron, a systemd timer, or a scheduled Grok Bot routine
 # (for hosts where PID 1 isn't systemd and cron isn't installed).
+umask 077
 cd "$(dirname "$0")"
 if [ -f .env ]; then
   # Existing environment variables win over .env (same rule as start.sh / relay.py).

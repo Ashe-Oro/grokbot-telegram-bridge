@@ -7,8 +7,10 @@ transcriber.py (faster-whisper in a separate venv) in a long-lived subprocess.
 Configuration comes from environment variables (see .env.example).
 Secrets come only from the environment; nothing secret is logged or saved.
 """
-import base64, collections, fcntl, json, os, re, secrets, select, shutil, subprocess, sys, threading, time, urllib.error, urllib.request
+import base64, collections, fcntl, json, math, os, re, secrets, select, shutil, subprocess, sys, threading, time, urllib.error, urllib.request
 from contextlib import contextmanager
+
+os.umask(0o077)                    # also covers library use and approve.py
 
 CODE_DIR = os.path.dirname(os.path.abspath(__file__))
 # Runtime data (state, outbox, media, logs) lives here. The receiving Grok Bot must be able
@@ -22,6 +24,7 @@ CODE_TTL = 24 * 3600
 MAX_TEXT = 4096
 MEDIA = os.path.join(HOME, "media")
 MAX_FILE = 20 * 1024 * 1024          # Telegram Bot API getFile limit
+MAX_VOICE_SECONDS = float(os.environ.get("GROKBOT_ASR_MAX_SECONDS") or "600")
 MEDIA_TTL = 7 * 24 * 3600
 BOT_NAME = os.environ.get("GROKBOT_BOT_NAME") or "The bot"
 ASR_PY = os.environ.get("GROKBOT_ASR_PYTHON") or os.path.join(CODE_DIR, ".venv-asr", "bin", "python")
@@ -38,6 +41,7 @@ def load_dotenv(path=None):
     try:
         with open(path) as f:
             lines = f.read().splitlines()
+            readable = os.fstat(f.fileno()).st_mode & 0o044
     except FileNotFoundError:
         return
     for line in lines:
@@ -53,10 +57,41 @@ def load_dotenv(path=None):
             v = v[1:-1]
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k) and k not in os.environ:
             os.environ[k] = v
+    if readable:
+        log("warning: .env is group- or other-readable; run chmod 600 .env")
+
+def private_dir(path):
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    os.chmod(path, 0o700)
+
+def private_open(path, mode):
+    """Set permissions before writing, including when the file already exists."""
+    flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if "a" in mode else os.O_TRUNC)
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        return os.fdopen(fd, mode)
+    except Exception:
+        os.close(fd)
+        raise
+
+def secure_runtime():
+    for path in (HOME, OUTBOX, FAILED, MEDIA):
+        private_dir(path)
+    # Only media is traversed; do not chmod the code or a shared data tree recursively.
+    for root, _, names in os.walk(MEDIA):
+        private_dir(root)
+        for name in names:
+            os.chmod(os.path.join(root, name), 0o600)
+    for path in (STATE, STATE + ".bak-preroles", LOCK,
+                 os.path.join(HOME, "transcriber.err"), os.path.join(HOME, "relay.log")):
+        if os.path.exists(path):
+            os.chmod(path, 0o600)
 
 def configure_paths():
     """(Re)compute data paths from GROKBOT_DATA_DIR. Called after .env is loaded."""
-    global HOME, STATE, LOCK, OUTBOX, FAILED, MEDIA, BOT_NAME, ASR_PY, ASR_TIMEOUT, TYPING_MAX
+    global HOME, STATE, LOCK, OUTBOX, FAILED, MEDIA, BOT_NAME, ASR_PY, ASR_TIMEOUT, TYPING_MAX, MAX_VOICE_SECONDS
+    os.umask(0o077)
     HOME = os.path.abspath(os.environ.get("GROKBOT_DATA_DIR") or CODE_DIR)
     STATE, LOCK = os.path.join(HOME, "state.json"), os.path.join(HOME, "state.lock")
     OUTBOX = os.path.join(HOME, "outbox")
@@ -65,6 +100,9 @@ def configure_paths():
     BOT_NAME = os.environ.get("GROKBOT_BOT_NAME") or "The bot"
     ASR_PY = os.environ.get("GROKBOT_ASR_PYTHON") or os.path.join(CODE_DIR, ".venv-asr", "bin", "python")
     ASR_TIMEOUT = int(os.environ.get("GROKBOT_ASR_TIMEOUT") or "180")
+    MAX_VOICE_SECONDS = float(os.environ.get("GROKBOT_ASR_MAX_SECONDS") or "600")
+    if not math.isfinite(MAX_VOICE_SECONDS) or MAX_VOICE_SECONDS <= 0:
+        raise ValueError("ASR duration limit must be positive and finite")
     TYPING_MAX = float(os.environ.get("GROKBOT_TYPING_MAX") or "180")
 
 def log(msg):
@@ -89,7 +127,8 @@ def _migrate_roles(s):
     if "roles" in s:
         return False
     if os.path.exists(STATE) and not os.path.exists(STATE + ".bak-preroles"):
-        shutil.copy2(STATE, STATE + ".bak-preroles")
+        with open(STATE, "rb") as src, private_open(STATE + ".bak-preroles", "wb") as dst:
+            shutil.copyfileobj(src, dst)
     al = s.get("allowlist") or []
     s["roles"] = {str(u): ("admin" if i == 0 else "member") for i, u in enumerate(al)}
     return True
@@ -109,10 +148,12 @@ def role_of(s, uid):
 
 @contextmanager
 def state(write=True):
-    with open(LOCK, "a") as lf:
+    private_dir(os.path.dirname(STATE))
+    with private_open(LOCK, "a") as lf:
         fcntl.flock(lf, fcntl.LOCK_EX)
         try:
             with open(STATE) as f:
+                os.fchmod(f.fileno(), 0o600)
                 s = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
             s = _blank()
@@ -129,8 +170,9 @@ def state(write=True):
         _sync(s)
         if write:
             tmp = STATE + ".tmp"
-            with open(tmp, "w") as f:
+            with private_open(tmp, "w") as f:
                 json.dump(s, f, indent=2)
+                os.fchmod(f.fileno(), 0o600)
             os.replace(tmp, STATE)
 
 def parse_allowlist(raw, var="GROKBOT_ALLOWLIST"):
@@ -293,12 +335,13 @@ def download_file(file_id, dest_dir, ext):
     fp = info.get("file_path")
     if not fp:
         raise DownloadError("no file_path")
-    os.makedirs(dest_dir, exist_ok=True)
+    private_dir(MEDIA)
+    private_dir(dest_dir)
     dest = os.path.join(dest_dir, "media" + ext)
     tmp = dest + ".part"
     try:
         with _open_file_url(f"https://api.telegram.org/file/bot{os.environ['TELEGRAM_BOT_TOKEN']}/{fp}", 60) as r, \
-                open(tmp, "wb") as f:
+                private_open(tmp, "wb") as f:
             n = 0
             while True:
                 chunk = r.read(65536)
@@ -368,10 +411,10 @@ class Transcriber:
         return json.loads(line)
 
     def _start(self):
-        errf = open(os.path.join(HOME, "transcriber.err"), "ab")
-        self.proc = subprocess.Popen([ASR_PY, ASR_SCRIPT], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=errf, text=True, bufsize=1, cwd=CODE_DIR)
-        errf.close()
+        private_dir(HOME)
+        with private_open(os.path.join(HOME, "transcriber.err"), "ab") as errf:
+            self.proc = subprocess.Popen([ASR_PY, ASR_SCRIPT], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                         stderr=errf, text=True, bufsize=1, cwd=CODE_DIR)
         if not self._readline(ASR_LOAD_TIMEOUT).get("ready"):
             raise RuntimeError("transcriber not ready")
 
@@ -523,6 +566,23 @@ def run_member_job(*args):
         _member_job(*args)
 
 # ---------- inbound handling ----------
+def is_forwarded(msg):
+    return any(msg.get(k) for k in ("forward_origin", "forward_from", "forward_from_chat",
+               "forward_from_message_id", "forward_sender_name", "forward_date", "is_automatic_forward"))
+
+def forward_info(msg):
+    """Compact forward provenance for the webhook; never logged."""
+    origin = msg.get("forward_origin") or {}
+    user = origin.get("sender_user") or msg.get("forward_from") or {}
+    chat = origin.get("chat") or origin.get("sender_chat") or msg.get("forward_from_chat") or {}
+    info = {"forwarded": is_forwarded(msg)}
+    fields = {"type": origin.get("type"), "user_id": user.get("id"), "chat_id": chat.get("id"),
+              "message_id": origin.get("message_id", msg.get("forward_from_message_id")),
+              "date": origin.get("date", msg.get("forward_date")),
+              "sender_name": origin.get("sender_user_name", msg.get("forward_sender_name"))}
+    info.update((k, v) for k, v in fields.items() if v is not None)
+    return info
+
 class Bot:
     def __init__(self):
         me = tg("getMe", timeout=15)
@@ -588,6 +648,11 @@ class Bot:
                 log(f"update_id={upd['update_id']} user_id={uid} role={role} command={verb} denied")
                 send_text(chat["id"], ADMIN_ONLY_REPLY, mid)
                 return
+            if is_forwarded(msg):
+                log(f"update_id={upd['update_id']} forwarded role-management command ignored")
+                send_text(chat["id"], "I only accept /approve, /promote, and /demote when you type "
+                          "them yourself, not from a forwarded message.", mid)
+                return
             if verb == "/approve":
                 p = approve_code(cmd[1]) if len(cmd) > 1 else None
                 send_text(chat["id"], f"Approved user {p['user_id']} as {p['role']}." if p else
@@ -614,7 +679,7 @@ class Bot:
                  "chat_id": chat["id"], "chat_type": ctype, "chat_title": chat.get("title"),
                  "message_id": msg.get("message_id"), "user_id": uid,
                  "username": user.get("username"), "first_name": user.get("first_name"),
-                 "text": text, "date": msg.get("date"),
+                 "text": text, "date": msg.get("date"), "forward": forward_info(msg),
                  "reply_file": os.path.join(OUTBOX, f"{upd['update_id']}.json"),
                  "kind": kind, "media_path": None, "transcript": None, "role": "admin"}
         name = f"{upd['update_id']}.json"
@@ -654,6 +719,11 @@ class Bot:
     def prepare_media(self, upd, msg, media, event):
         """Download (and for voice, transcribe) the attachment into event. False = stop."""
         chat_id, mid, uidd = msg["chat"]["id"], msg.get("message_id"), upd["update_id"]
+        duration = media.get("duration")
+        if media["kind"] == "voice" and duration is not None and duration > MAX_VOICE_SECONDS:
+            log(f"update_id={uidd} kind=voice rejected (too long)")
+            send_text(chat_id, f"That voice note is too long. Please send audio up to {MAX_VOICE_SECONDS:g} seconds long.", mid)
+            return False
         if (media.get("size") or 0) > MAX_FILE:
             log(f"update_id={uidd} kind={media['kind']} rejected size={media['size']} (over 20MB)")
             send_text(chat_id, "That file is over Telegram's 20 MB limit for bots, so I can't open it. "
@@ -796,12 +866,12 @@ def outbox_loop():
 _last_cleanup = 0.0
 
 def main():
+    os.umask(0o077)
     load_dotenv()
     configure_paths()
     if not os.environ.get("TELEGRAM_BOT_TOKEN"):
         sys.exit("TELEGRAM_BOT_TOKEN is not set")
-    os.makedirs(FAILED, exist_ok=True)
-    os.makedirs(MEDIA, exist_ok=True)
+    secure_runtime()
     seed_allowlist()
     if "--check" in sys.argv:
         try:

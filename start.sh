@@ -4,6 +4,7 @@
 # Refuses to start unless the webhook URL and key are set, unless --pairing-only is given.
 # Launches supervise.sh, which restarts relay.py a few seconds after any exit.
 set -eu
+umask 077
 cd "$(dirname "$0")"
 if [ -f .env ]; then
   # Existing environment variables win over .env (same rule as relay.py).
@@ -21,6 +22,7 @@ if [ -f .env ]; then
 fi
 DATA_DIR="${GROKBOT_DATA_DIR:-$(pwd)}"
 mkdir -p "$DATA_DIR"
+chmod 700 "$DATA_DIR"
 PID="$DATA_DIR/relay.pid"
 LOG="$DATA_DIR/relay.log"
 [ -n "${TELEGRAM_BOT_TOKEN:-}" ] || { echo "TELEGRAM_BOT_TOKEN not set"; exit 1; }
@@ -33,4 +35,5 @@ if [ -f "$PID" ] && kill -0 "$(cat "$PID")" 2>/dev/null; then echo "already runn
 python3 relay.py --check || exit 1
 setsid nohup ./supervise.sh >/dev/null 2>&1 < /dev/null &
 echo $! > "$PID"
+chmod 600 "$PID"
 echo "started pid $(cat "$PID"); log: $LOG"

@@ -4,6 +4,38 @@ This bridge lets people in Telegram start runs of your Grok Bot. That is powerfu
 the main risk. This page is a candid look at what the bridge protects, what it doesn't, and
 what you should do about it.
 
+## Host trust: processes sharing a Unix user are fully trusted
+
+This bridge is designed for a **private household host**. Every process running as the
+**same Unix user** as the relay is fully trusted. File modes (`chmod 600 .env`) do not
+separate processes that share a UID. Any co-resident Grok Bot agent (or other program)
+with that UID can read `.env` and `state.json`, run `approve.py --add <id> --admin`, write
+to `outbox/`, or call the webhook directly. Telegram pairing and roles do not apply to
+that path.
+
+Tightening file modes only protects against **other user accounts** on the same machine,
+not against other agents that share this UID. The relay enforces 0700 on runtime data
+directories and 0600 on its runtime files, and warns if `.env` is group- or other-readable.
+It does not change `.env` permissions; keep using `chmod 600 .env`.
+
+### Optional hardening: Run the relay as a separate Unix user
+
+- Create a dedicated user, for example `grokbot-telegram`, that other agents cannot assume
+  (no shared login credentials or permission to switch to it).
+- Run the relay under that account, and keep the code, `.env`, `state.json`, and data
+  directory owned by it. Use the host's user-management tools and launch the scripts as
+  that user; systemd is optional.
+- If the receiving Grok Bot runs on a different account, give it narrowly scoped access
+  only to `media/` (read) and `outbox/` (write). Use ACLs, or a shared group with modes
+  such as 0770 on directories and 0660 on files, including execute on directories so
+  the other account can traverse them. The relay resets its managed paths to 0700/0600
+  on startup, which will clear those group bits, so re-apply the shared-group or ACL
+  grants after start (or adapt the permission helpers for your setup). Default ACLs
+  alone are not enough. Do not grant access to `.env`, state, or code. If both
+  processes share a UID, they are fully trusted and this isolation does not apply.
+- Keep approval administration (`approve.py`) on the operator's side, run under the
+  relay account through an operator-controlled login.
+
 ## The big one: Telegram users drive your agent
 
 A webhook routine runs as your Grok Bot, **with that bot's connectors and tools**. If the bot
@@ -148,10 +180,10 @@ Anyone with it can read your bot's updates and send as your bot. Revoke it in Bo
 - The relay only makes outbound connections (Telegram, the webhook, and the member chat
   API). There are no inbound ports, tunnels, or Tailscale.
 - Webhook POSTs go over HTTPS to the Grok Bot service.
-- **Media is stored on disk** under `media/<update_id>/` and deleted after 7 days. Anyone
-  with access to that machine can read photos and voice notes until then. Transcripts are
-  not stored by the relay, but they are part of the webhook body and become part of the
-  bot's run history.
+- **Media is stored on disk** under `media/<update_id>/` and deleted after 7 days. Processes
+  sharing the relay's UID, and accounts granted media access, can read it until then.
+  Transcripts are not stored by the relay, but they are part of the webhook body and
+  become part of the bot's run history.
 - `state.json` holds Telegram user ids, usernames, first names, and pending codes. No
   secrets, but it is personal data.
 
@@ -159,9 +191,10 @@ Anyone with it can read your bot's updates and send as your bot. Revoke it in Bo
 
 The relay sends every valid `.json` file in `outbox/` to whatever `chat_id` it names. It
 doesn't check that the chat is one the bot was talking to. So **anyone who can write to the
-outbox folder can make your bot send any text to any chat it can reach.** Keep the data
-directory owned by the user that runs the relay and the bot, and don't share it with other
-users or services.
+outbox folder can make your bot send any text to any chat it can reach**, including
+same-UID agents. File modes only help against other accounts; they do not restrict those
+agents. Keep outbox write access limited to trusted senders, including any separate bot
+account granted access as described above.
 
 ## Not built yet
 

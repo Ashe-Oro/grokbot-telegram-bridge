@@ -11,7 +11,7 @@
 Admins' messages go to the Grok Bot webhook (full agent). Members only get chat replies from a
 no-tools LLM call and can never reach the webhook. Only admins can /approve, /promote, /demote.
 """
-import os, sys
+import sys
 import relay
 from relay import ROLES, approve_code, remove_user, set_role, state
 
@@ -34,7 +34,7 @@ def _show(s):
 def main(a):
     relay.load_dotenv()          # picks up GROKBOT_DATA_DIR from .env, if set
     relay.configure_paths()
-    os.makedirs(relay.HOME, exist_ok=True)
+    relay.secure_runtime()
     a = list(a)
     if not a or a[0] in ("-h", "--help"):
         print(__doc__); return 1

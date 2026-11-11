@@ -7,6 +7,7 @@ faster-whisper venv (GROKBOT_ASR_PYTHON, default ./.venv-asr/bin/python); they a
 if it is missing. tests/fixtures/speech.ogg is a public-domain clip (JFK, 1961 inaugural
 address) re-encoded from whisper.cpp's samples/jfk.wav."""
 import contextlib, io, json, os, shutil, subprocess, sys, tempfile, time, unittest, urllib.error
+from unittest.mock import patch
 
 FAKE_TOKEN = "123456789:FAKE_test_TOKEN_abcdefghijklmnopqrstu"
 FAKE_KEY = "fake-webhook-key-zzz"
@@ -114,6 +115,7 @@ class TestText(Base):
         ev = self.forwarded[0]
         self.assertEqual((ev["text"], ev["kind"], ev["media_path"], ev["transcript"]), ("hello there", "text", None, None))
         self.assertEqual(ev["reply_file"], os.path.join(relay.OUTBOX, "1.json"))
+        self.assertEqual(ev["forward"], {"forwarded": False})
         self.assertNotIn("hello there", self.out.getvalue())
 
     def test_group_needs_mention(self):
@@ -237,6 +239,90 @@ class TestRoles(Base):
             self.assertEqual(s["allowlist"], [OWNER, 555])
         self.assertFalse(self.forwarded)
 
+    def test_forwarded_promote_is_ignored(self):
+        self.add_member()
+        markers = {"forward_origin": {"type": "user", "sender_user": {"id": MEMBER}},
+                   "forward_from": {"id": MEMBER}, "forward_date": 1,
+                   "forward_sender_name": "Original sender", "forward_from_chat": {"id": -5},
+                   "forward_from_message_id": 7, "is_automatic_forward": True}
+        for i, (key, value) in enumerate(markers.items()):
+            with self.subTest(field=key):
+                self.upd(200 + i, {"text": f"/promote {MEMBER}", key: value})
+                with relay.state(write=False) as s:
+                    self.assertEqual(relay.role_of(s, MEMBER), "member")
+                self.assertFalse(self.forwarded); self.assertFalse(self.llm)
+                self.assertIn("forwarded message", self.sends()[-1]["text"])
+                self.assertEqual(self.sends()[-1]["reply_to_message_id"], 7)
+        self.assertIn("forwarded role-management command ignored", self.out.getvalue())
+        self.assertNotIn("Original sender", self.out.getvalue())
+
+    def test_fresh_promote_still_works(self):
+        for chat in (None, {"id": -5, "type": "group"}, {"id": -5, "type": "supergroup"}):
+            with self.subTest(chat=chat):
+                self.add_member()
+                command = "/promote" + (MENTION if chat else "")
+                self.upd(210, {"text": f"{command} {MEMBER}", "entities": [
+                    {"type": "bot_command", "offset": 0, "length": len(command)}]}, chat=chat)
+                with relay.state(write=False) as s:
+                    self.assertEqual(relay.role_of(s, MEMBER), "admin")
+                self.assertFalse(self.forwarded)
+
+    def test_forwarded_approve_does_not_consume_code(self):
+        pending = {"user_id": STRANGER, "created": time.time()}
+        with relay.state() as s:
+            s["pending"]["ABC123"] = pending
+        self.upd(211, {"text": "/approve ABC123", "forward_date": 1})
+        with relay.state(write=False) as s:
+            self.assertEqual(s["pending"]["ABC123"], pending)
+            self.assertIsNone(relay.role_of(s, STRANGER))
+            self.assertNotIn(STRANGER, s["allowlist"])
+        self.assertFalse(self.forwarded)
+        self.assertIn("forwarded message", self.sends()[0]["text"])
+        self.assertNotIn("ABC123", self.out.getvalue())
+
+    def test_forwarded_demote_is_ignored(self):
+        with relay.state() as s:
+            s["roles"][str(MEMBER)] = "admin"
+        command = "/demote" + MENTION
+        self.upd(212, {"text": f"{command} {MEMBER}", "forward_date": 1,
+                      "entities": [{"type": "bot_command", "offset": 0, "length": len(command)}]},
+                 chat={"id": -5, "type": "group"})
+        with relay.state(write=False) as s:
+            self.assertEqual(relay.role_of(s, MEMBER), "admin")
+        self.assertFalse(self.forwarded)
+        self.assertIn("forwarded message", self.sends()[0]["text"])
+
+    def test_forwarded_admin_text_still_forwards(self):
+        cases = [({"forward_origin": {"type": "user", "sender_user": {"id": MEMBER}, "date": 1}},
+                  {"forwarded": True, "type": "user", "user_id": MEMBER, "date": 1}),
+                 ({"forward_from": {"id": MEMBER}, "forward_date": 1},
+                  {"forwarded": True, "user_id": MEMBER, "date": 1}),
+                 ({"forward_origin": {"type": "hidden_user", "sender_user_name": "Original sender", "date": 1}},
+                  {"forwarded": True, "type": "hidden_user", "sender_name": "Original sender", "date": 1}),
+                 ({"forward_origin": {"type": "chat", "sender_chat": {"id": -5}, "date": 1}},
+                  {"forwarded": True, "type": "chat", "chat_id": -5, "date": 1}),
+                 ({"forward_origin": {"type": "channel", "chat": {"id": -5}, "message_id": 7, "date": 1}},
+                  {"forwarded": True, "type": "channel", "chat_id": -5, "message_id": 7, "date": 1}),
+                 ({"forward_from_chat": {"id": -5}, "forward_from_message_id": 7,
+                   "forward_sender_name": "Original sender", "forward_date": 1},
+                  {"forwarded": True, "chat_id": -5, "message_id": 7, "sender_name": "Original sender", "date": 1})]
+        for i, (fields, expected) in enumerate(cases):
+            with self.subTest(fields=fields):
+                self.upd(220 + i, {"text": "forwarded text", **fields})
+                self.assertEqual(self.forwarded[-1]["forward"], expected)
+                self.assertEqual(self.forwarded[-1]["text"], "forwarded text")
+        self.assertEqual(len(self.forwarded), len(cases))
+        self.assertNotIn("Original sender", self.out.getvalue())
+        self.assertNotIn("forwarded text", self.out.getvalue())
+
+    def test_member_forwarded_promote_still_denied(self):
+        self.add_member()
+        self.upd(230, {"text": f"/promote {MEMBER}", "forward_from": {"id": MEMBER}}, user=MEMBER)
+        with relay.state(write=False) as s:
+            self.assertEqual(relay.role_of(s, MEMBER), "member")
+        self.assertEqual(self.sends()[0]["text"], "Only an admin can do that.")
+        self.assertFalse(self.forwarded); self.assertFalse(self.llm)
+
     def test_whoami_shows_role(self):
         self.add_member()
         self.upd(70, {"text": "/whoami"}, user=MEMBER)
@@ -318,6 +404,39 @@ class TestPhoto(Base):
         self.assertFalse(self.forwarded); self.assertFalse(self.urls)
 
 class TestLimitsAndErrors(Base):
+    def test_voice_duration_over_cap_not_downloaded(self):
+        for user in (OWNER, MEMBER):
+            with relay.state() as s:
+                s["roles"][str(MEMBER)] = "member"
+            for field in ("voice", "audio", "video_note"):
+                with self.subTest(user=user, field=field):
+                    self.upd(60, {field: {"file_id": "v", "duration": relay.MAX_VOICE_SECONDS + 1,
+                                         "file_size": 10}}, user=user)
+        self.assertFalse(any(m == "getFile" for m, _ in self.calls))
+        self.assertFalse(self.urls); self.assertFalse(os.listdir(relay.MEDIA))
+        self.assertFalse(self.forwarded); self.assertFalse(self.llm)
+        self.assertEqual(len(self.sends()), 6)
+        self.assertTrue(all("too long" in p["text"] for p in self.sends()))
+
+    def test_voice_duration_under_cap_is_downloaded(self):
+        self.files = {"v": fixture("sine.ogg")}
+        with patch.object(relay.TRANSCRIBER, "transcribe", return_value=("", None)):
+            for i, duration in enumerate((relay.MAX_VOICE_SECONDS / 2, relay.MAX_VOICE_SECONDS)):
+                self.upd(64 + i, {"voice": {"file_id": "v", "duration": duration}})
+        self.assertEqual(sum(m == "getFile" for m, _ in self.calls), 2)
+        self.assertEqual(len(self.urls), 2)
+        self.assertEqual(len(self.forwarded), 2)
+        self.assertTrue(all(os.path.isfile(ev["media_path"]) for ev in self.forwarded))
+
+    def test_voice_missing_duration_still_downloads(self):
+        self.files = {"v": fixture("sine.ogg")}
+        with patch.object(relay.TRANSCRIBER, "transcribe", return_value=("", None)):
+            for i, duration in enumerate(({}, {"duration": None})):
+                self.upd(62 + i, {"voice": {"file_id": "v", **duration}})
+        self.assertEqual(sum(m == "getFile" for m, _ in self.calls), 2)
+        self.assertEqual(len(self.urls), 2)
+        self.assertTrue(all(os.path.isfile(ev["media_path"]) for ev in self.forwarded))
+
     def test_oversize_declared(self):
         self.upd(20, {"document": {"file_id": "x", "mime_type": "image/jpeg", "file_size": 25 << 20}})
         self.assertFalse(self.forwarded); self.assertFalse(self.urls)
