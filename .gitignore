@@ -1,0 +1,25 @@
+# secrets
+.env
+*.env
+!.env.example
+webhook_url.txt
+
+# runtime state (see GROKBOT_DATA_DIR)
+state.json
+state.json.tmp
+state.lock
+relay.log
+relay.pid
+transcriber.err
+outbox/
+media/
+data/
+
+# local backups and environments
+*.bak
+*.bak-*
+.venv/
+.venv-asr/
+venv/
+__pycache__/
+*.pyc

@@ -1,0 +1,5 @@
+# Only needed for voice notes. Install into a separate venv (see README or docs/SETUP.md):
+#   python3 -m venv .venv-asr && .venv-asr/bin/pip install -r requirements-asr.txt
+# relay.py itself uses only the Python standard library.
+faster-whisper>=1.2,<2
+numpy

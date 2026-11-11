@@ -1,0 +1,27 @@
+# Example systemd unit. Adjust User, paths, and EnvironmentFile, then:
+#   sudo cp examples/grokbot-telegram-bridge.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now grokbot-telegram-bridge
+#   journalctl -u grokbot-telegram-bridge -f
+# Use this instead of start.sh / supervise.sh / ensure.sh, not alongside them.
+# systemd already restarts the relay on failure and at boot, so you do not need
+# the watchdog scripts or the keep-alive routine on a systemd host.
+[Unit]
+Description=Grok Bot Telegram bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=youruser
+WorkingDirectory=/opt/grokbot-telegram-bridge
+# KEY=VALUE file with TELEGRAM_BOT_TOKEN, GROKBOT_WEBHOOK_URL, GROKBOT_WEBHOOK_KEY, ...
+# Make it readable only by root/youruser (chmod 600).
+EnvironmentFile=/opt/grokbot-telegram-bridge/.env
+ExecStartPre=/usr/bin/python3 relay.py --check
+ExecStart=/usr/bin/python3 -u relay.py
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
