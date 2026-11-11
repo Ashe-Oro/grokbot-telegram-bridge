@@ -1,6 +1,6 @@
 # Setup guide
 
-This is the full setup and operations guide for the [Grok Bot Telegram bridge](../README.md). Start with the README if you just want the short version. The fastest path is to paste [SETUP-PROMPT.md](../SETUP-PROMPT.md) into your existing Grok Bot; that bot creates a dedicated setup bot and the new bot walks the human through these steps.
+This is the full setup and operations guide for the [Grok Bot Telegram bridge](../README.md). Start with the README if you just want the short version. The fastest path is to paste the short prompt in [SETUP-PROMPT.md](../SETUP-PROMPT.md) (also at the top of the README) into your existing Grok Bot; that bot creates a dedicated setup bot, and the new bot walks the human through [SETUP-GUIDE.md](SETUP-GUIDE.md) one step at a time. No GitHub account is needed.
 
 A small relay that puts a [Grok Bot](https://cursor.com/help/grok-bot) in Telegram. People
 you approve can message the bot in a DM or @mention it in a group, send photos and voice
@@ -103,9 +103,18 @@ controls what Telegram delivers.
 
 ### 3. Configure
 
+No GitHub account or credentials are needed. Prefer the public zip; an
+anonymous `git clone` of the HTTPS URL is also fine. Do not use SSH or a
+GitHub token.
+
 ```bash
-git clone <this repo> grokbot-telegram-bridge
+curl -fsSL -o /tmp/grokbot-telegram-bridge.zip \
+  https://github.com/Ashe-Oro/grokbot-telegram-bridge/archive/refs/heads/main.zip
+unzip -q /tmp/grokbot-telegram-bridge.zip
+mv grokbot-telegram-bridge-main grokbot-telegram-bridge
 cd grokbot-telegram-bridge
+# Or: git clone https://github.com/Ashe-Oro/grokbot-telegram-bridge.git
+#      cd grokbot-telegram-bridge
 cp .env.example .env
 chmod 600 .env
 # edit .env: TELEGRAM_BOT_TOKEN, GROKBOT_WEBHOOK_URL, GROKBOT_WEBHOOK_KEY
@@ -368,7 +377,9 @@ Not built yet. Contributions welcome.
 
 ## More
 
-- [README](../README.md): short overview and quick start
+- [README](../README.md): short overview, plus the copy-paste setup prompt
+- [SETUP-PROMPT.md](../SETUP-PROMPT.md): the same short copy-paste prompt
+- [SETUP-GUIDE.md](SETUP-GUIDE.md): numbered walkthrough the dedicated bot follows one step at a time
 - [SECURITY.md](../SECURITY.md): threat model and how to report a vulnerability
 - [HOW-WE-BUILT-IT.md](HOW-WE-BUILT-IT.md): the build story and the bugs we hit
 - [examples/](../examples/): routine prompt, keep-alive routine, and an optional systemd unit for self-hosting elsewhere
