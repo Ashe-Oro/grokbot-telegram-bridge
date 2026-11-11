@@ -1,11 +1,12 @@
-# Keep-alive routine (for hosts without systemd)
+# Keep-alive routine
 
-On machines where you can't install a systemd unit — for example the Grok Bot
-box, whose PID 1 is not systemd and which often has no cron — run `ensure.sh`
-from a scheduled Grok Bot routine. An hourly schedule is usually enough: after
-a reboot the bridge may be down for up to an hour.
+The intended setup runs the bridge on your Grok Bot's own always-on Linux
+computer. That machine's PID 1 is not systemd and often has no cron, so run
+`ensure.sh` from a scheduled Grok Bot routine. An hourly schedule is usually
+enough: after a reboot the bridge may be down for up to an hour.
 
-If you already run the example systemd unit, you don't need this routine.
+You don't need this routine if you optionally self-host the relay elsewhere
+with the example systemd unit.
 
 ## Setup
 

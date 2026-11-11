@@ -1,13 +1,19 @@
 # Setup guide
 
-This is the full setup and operations guide for the [Grok Bot Telegram bridge](../README.md). Start with the README if you just want the short version.
+This is the full setup and operations guide for the [Grok Bot Telegram bridge](../README.md). Start with the README if you just want the short version. The fastest path is to paste [SETUP-PROMPT.md](../SETUP-PROMPT.md) into your existing Grok Bot; that bot creates a dedicated setup bot and the new bot walks the human through these steps.
 
-A small, self-hosted relay that puts a [Grok Bot](https://cursor.com/help/grok-bot) in
-Telegram. People you approve can message the bot in a DM or @mention it in a group, send
-photos and voice notes, and get answers back in the same chat.
+A small relay that puts a [Grok Bot](https://cursor.com/help/grok-bot) in Telegram. People
+you approve can message the bot in a DM or @mention it in a group, send photos and voice
+notes, and get answers back in the same chat.
+
+**Where it runs.** The bridge is meant to run on your Grok Bot's own always-on Linux
+computer. Ask your Grok Bot to set it up and start it there. Nothing needs to run on your
+laptop or phone, and you don't host this on Vercel, Cloudflare, a VPS, or similar. The
+relay only makes outbound connections (it long-polls Telegram and POSTs to your bot's
+webhook), so there are no inbound ports, tunnels, or Tailscale.
 
 It is one Python file using only the standard library, plus an optional local speech-to-text
-helper for voice notes. It needs no inbound ports, no public server, and no database.
+helper for voice notes. There is no database.
 
 > **Status:** early and small. It works well for one household, but it has not been hardened
 > for public bots. Read [SECURITY.md](../SECURITY.md) before you connect it to a bot that has
@@ -35,7 +41,7 @@ sequenceDiagram
     autonumber
     participant U as Telegram user / group
     participant T as Telegram Bot API
-    participant R as relay.py (your Linux box)
+    participant R as relay.py (your Grok Bot's computer)
     participant G as Grok Bot webhook routine
     participant O as outbox/ (shared filesystem)
 
@@ -68,8 +74,10 @@ sequenceDiagram
 
 ## Quickstart
 
-You need: a persistent Linux machine the Grok Bot can also read and write files on (for
-example the bot's own computer), Python 3.10+, and `ffmpeg` if you want voice notes.
+The usual path is to ask your Grok Bot to run the steps below on its own always-on
+Linux computer. You need Python 3.10+ on that machine, and `ffmpeg` if you want voice
+notes. The bot and the relay share the same filesystem, which is why they live together.
+Nothing needs to run on your laptop or phone.
 
 ### 1. Create the Telegram bot
 
@@ -111,7 +119,7 @@ win over it. See [.env.example](../.env.example) for the full list:
 | `TELEGRAM_BOT_TOKEN` | yes | BotFather token |
 | `GROKBOT_WEBHOOK_URL` | to forward | The routine's webhook URL |
 | `GROKBOT_WEBHOOK_KEY` | to forward | Sent as `Authorization: Bearer <key>` |
-| `GROKBOT_ADMINS` | no | Telegram user ids that are admins (comma separated). Put your own id here |
+| `GROKBOT_ADMINS` | first admin | Telegram user ids that are admins (comma separated). The host puts their own id here to become the first admin |
 | `GROKBOT_ALLOWLIST` | no | Telegram user ids added as members from the start (comma separated) |
 | `GROKBOT_MEMBER_LLM_API_KEY` | for members | API key for the members' chat model. Unset: members get "I'm only set up to chat with admins right now." |
 | `GROKBOT_MEMBER_LLM_BASE_URL` | no | OpenAI-compatible base URL (default `https://api.x.ai/v1`) |
@@ -166,23 +174,40 @@ python3 approve.py --role <id> admin      # change a role (admin|member)
 python3 approve.py --remove <id>
 ```
 
-Or, as an admin, send `/approve 3FA9C1` to the bot in Telegram (approves as member), then
-`/promote <user_id>` or `/demote <user_id>` if needed. Members who try these get "Only an
-admin can do that." Codes expire after 24 hours. `/whoami` replies with your user id, the
-chat id, and your role, which is handy for `GROKBOT_ADMINS` and for proactive messages.
+Or, as an admin, approve from Telegram. Commands go to the bridge itself, not to the
+Grok Bot:
 
-To bootstrap, either set your own id in `GROKBOT_ADMINS`, or start the bridge, message the
-bot, and approve your own code with `python3 approve.py <CODE> --admin`.
+- **In a DM** with the bot: `/approve 3FA9C1`
+- **In a group:** `/approve@YourBot 3FA9C1`, or reply to one of the bot's messages with
+  `/approve 3FA9C1`. A plain `/approve 3FA9C1` in a group (not addressed to the bot) is
+  ignored, because the bridge only answers group messages aimed at the bot.
+
+`/approve` always adds the person as a member. Then `/promote <user_id>` or
+`/demote <user_id>` if needed. The same addressing rules apply to those commands and to
+`/whoami`. Members who try `/approve`, `/promote`, or `/demote` get "Only an admin can
+do that." Codes expire after 24 hours. `/whoami` replies with your user id, the chat id,
+and your role, which is handy for `GROKBOT_ADMINS` and for proactive messages. Approving
+in a DM keeps the pairing code out of the group if you'd rather.
+
+The person who hosts the bot sets the first admin. Put your own Telegram user id in
+`GROKBOT_ADMINS` before starting, or start the bridge, message it, and approve your own
+code with `python3 approve.py <CODE> --admin`. The first person to message the bot is
+**not** made an admin automatically. Until an admin is set, nobody's messages reach the
+webhook.
 
 ### Roles: admins and members
 
-| | Admin | Member |
+| | Admin | Member (the default) |
 |---|---|---|
-| Messages go to | the Grok Bot webhook routine (full agent) | a plain chat-completion call made by the relay |
-| Tools, connectors, files, shell, routines, settings | whatever the bot has | **none** |
+| Chat (text, photos, voice notes) and get a reply | yes, via the Grok Bot webhook routine (full agent) | yes, via a plain no-tools chat-completion call made by the relay |
+| Tools, connectors, the host computer, files, processes, routines, settings | whatever the bot has | **none** — members can't run tools, search files, start or stop processes, create routines, or change settings |
 | Photos | saved; path in the event | sent to the chat model (JPEG/PNG) |
 | Voice notes | transcribed locally; transcript in the event | transcribed locally; transcript sent as text |
 | `/approve`, `/promote`, `/demote` | yes | "Only an admin can do that." |
+| `/whoami` | yes | yes |
+
+New people always join as members. The first admin is set by the person who hosts the bot
+(see above), not by the first person who messages it.
 
 Members never reach the webhook or any agent, so nothing they say can make the bot act. The
 member chat model gets a system prompt saying it can only chat, a rolling context of the
@@ -223,8 +248,10 @@ into several messages. A malformed file, or one Telegram rejects with a 4xx, mov
   chat model. Everything else is ignored and never leaves the machine.
 - An unknown person who mentions the bot gets a pairing code in the group.
 - DMs from approved users are always answered (admins via the webhook, members via the chat model).
-- Commands addressed as `/approve@YourBot`, `/promote@YourBot`, `/demote@YourBot`, and
-  `/whoami@YourBot` work in groups.
+- Admin commands in a group must be aimed at the bot: `/approve@YourBot CODE`, or a
+  reply to one of the bot's messages with `/approve CODE`. A plain `/approve CODE` in a
+  group is ignored. The same rules apply to `/promote`, `/demote`, and `/whoami`. In a
+  DM with the bot, the plain forms work.
 
 ## Photos and voice notes
 
@@ -260,12 +287,13 @@ scheduled routine. Routines that need a login or an approval will still need you
 
 ## How it runs
 
-- One supervisor process (`supervise.sh`) on a persistent Linux machine. It runs
-  `relay.py` and restarts it after 5 seconds if it exits. A second process for
+- One supervisor process (`supervise.sh`) on your Grok Bot's always-on Linux computer.
+  It runs `relay.py` and restarts it after 5 seconds if it exits. A second process for
   transcription starts on the first voice note. Inside the relay, a small loop refreshes
   Telegram's "typing..." every 4 seconds until the reply is sent or
   `GROKBOT_TYPING_MAX` seconds have passed (default 180).
-- Outbound HTTPS only (Telegram and the webhook). No inbound ports, no TLS certs.
+- Outbound HTTPS only (Telegram, the webhook, and the member chat API). No inbound ports,
+  no TLS certs, no tunnels, no Tailscale.
 - State is `state.json` (update offset, allowlist, roles, pending codes; no secrets), shared with
   `approve.py` through a file lock.
 - Logs (`relay.log`) carry update ids, user ids, chat types, kinds, sizes, and errors. They
@@ -276,17 +304,21 @@ scheduled routine. Routines that need a login or an approval will still need you
 - `ensure.sh` is an idempotent health check: if the supervisor is alive it exits 0 and
   prints `ok: running`; otherwise it runs `./start.sh`. It also warns if `ffmpeg` or the
   speech-to-text venv (`GROKBOT_ASR_PYTHON`, default `./.venv-asr/bin/python`) is missing,
-  without treating that as a hard failure. Run it from cron, a systemd timer, or a
-  scheduled Grok Bot routine — useful on hosts (including the Grok Bot box) where PID 1
-  is not systemd and cron is not installed. See
-  [examples/keepalive-routine.md](../examples/keepalive-routine.md).
+  without treating that as a hard failure. On the Grok Bot computer, run it from a
+  scheduled Grok Bot routine: that machine's PID 1 is not systemd and often has no cron,
+  so the keep-alive routine is the usual way to bring the bridge back after a reboot.
+  See [examples/keepalive-routine.md](../examples/keepalive-routine.md).
 
-On a machine with systemd, use the unit instead of `start.sh` / `supervise.sh` /
-`ensure.sh`, not alongside them. The unit restarts the relay on failure and at boot, so
-you don't need the watchdog scripts or the keep-alive routine:
+### Optional: self-host elsewhere with systemd
+
+The intended setup is the bot's own computer, using `start.sh` and the keep-alive routine
+above. If you instead run the relay on some other Linux machine that has systemd, you can
+use the example unit instead of `start.sh` / `supervise.sh` / `ensure.sh`, not alongside
+them. The unit restarts the relay on failure and at boot, so you don't need the watchdog
+scripts or the keep-alive routine. This is optional and not required for the usual setup.
 
 ```bash
-# systemd (see examples/grokbot-telegram-bridge.service)
+# optional, only if you self-host elsewhere (see examples/grokbot-telegram-bridge.service)
 sudo cp examples/grokbot-telegram-bridge.service /etc/systemd/system/
 sudoedit /etc/systemd/system/grokbot-telegram-bridge.service   # set User and paths
 sudo systemctl daemon-reload
@@ -315,10 +347,11 @@ logs or any file on disk.
 - **Text replies only.** The bot can't send photos or files back, edit messages, or react.
   Edited messages and reactions from users are ignored.
 - **Shared filesystem.** The bot must be able to write to `outbox/` and read `media/` at the
-  same absolute paths the relay uses. That's simplest when the relay runs on the bot's own
-  persistent computer. If you want the relay elsewhere (a VPS, a home server), you'd need
+  same absolute paths the relay uses. That's why the intended setup is the bot's own
+  always-on computer. Running the relay somewhere else (a VPS, a home server) would need
   another way back, for example a small authenticated HTTPS endpoint on the relay that the
-  bot POSTs replies to, or a synced folder. Neither is built yet.
+  bot POSTs replies to, or a synced folder. Neither is built, and you don't need it for
+  the usual setup.
 - **No rate limiting.** See [SECURITY.md](../SECURITY.md).
 - **Single instance.** Run one relay per Telegram bot token. Two pollers on the same token
   will fight over updates.
@@ -338,7 +371,7 @@ Not built yet. Contributions welcome.
 - [README](../README.md): short overview and quick start
 - [SECURITY.md](../SECURITY.md): threat model and how to report a vulnerability
 - [HOW-WE-BUILT-IT.md](HOW-WE-BUILT-IT.md): the build story and the bugs we hit
-- [examples/](../examples/): routine prompt, systemd unit, and a keep-alive routine
+- [examples/](../examples/): routine prompt, keep-alive routine, and an optional systemd unit for self-hosting elsewhere
 
 ## License
 

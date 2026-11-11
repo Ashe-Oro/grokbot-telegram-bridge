@@ -41,13 +41,28 @@ what the chat model says.
 
 Details:
 
-- Unknown or missing roles fail safe to `member`. New pairings are approved as `member`.
+- Unknown role values fail safe to `member`. A user with no role is not approved.
+- New people always join as `member`. `/approve` (in Telegram or `approve.py` without a
+  flag) and `approve.py --add <id>` all default to member.
+- The first admin is set by the person who hosts the bot: put their Telegram user id in
+  `GROKBOT_ADMINS`, or run `python3 approve.py <CODE> --admin` (or `--add <id> --admin`)
+  on the machine. The first person to message the bot is not made an admin automatically.
+  Until an admin is set, nobody's messages reach the webhook.
 - Only admins can `/approve`, `/promote <user_id>`, and `/demote <user_id>`; members get
   "Only an admin can do that." The last admin can't be demoted or removed.
-- `/whoami` shows the caller's role. It never runs anything.
+- In a DM with the bot, the plain commands work (`/approve CODE`). In a group, the command
+  must be aimed at the bot: `/approve@BotName CODE`, or a reply to one of the bot's
+  messages with `/approve CODE`. A plain `/approve` in a group is ignored. The same
+  addressing rules apply to `/promote`, `/demote`, and `/whoami`.
+- `/whoami` is allowed for members and admins. It shows the caller's role and never runs
+  anything else.
+- Members can chat (text, photos, voice notes) and get a reply from the no-tools model
+  call. They can't run tools, touch the host computer, search files, start or stop
+  processes, create routines, change settings, or approve or promote people.
 - Upgrading from a version without roles: the first id in the old allowlist becomes admin,
   everyone else becomes member, and the old file is copied to `state.json.bak-preroles`.
-  `GROKBOT_ADMINS` ids are always admin; `GROKBOT_ALLOWLIST` ids are added as members.
+  `GROKBOT_ADMINS` ids are always admin; `GROKBOT_ALLOWLIST` ids are added as members
+  only if they don't already have a role (existing admins are never demoted).
 - **Member messages leave your machine** for the chat model's provider (xAI by default),
   including photos they send. Pick a provider whose data terms you accept.
 - Each member reply is one paid API call. If `GROKBOT_MEMBER_LLM_API_KEY` is unset, members
@@ -74,13 +89,15 @@ tools, and a short admin list.
 
 ## Who can get in: allowlist and pairing codes
 
-- Only Telegram user ids on the allowlist are forwarded. Strangers who DM the bot, or mention
-  it in a group, get a random 6-hex-character pairing code, not access. Nothing they send is
-  forwarded, and their photos and voice notes are never downloaded.
+- Only approved Telegram user ids get a reply. Admin messages go to the webhook; member
+  messages go to the no-tools chat model and never to the webhook. Strangers who DM the bot,
+  or mention it in a group, get a random 6-hex-character pairing code, not access. Nothing
+  they send is forwarded, and their photos and voice notes are never downloaded.
 - Codes are single-use and expire after 24 hours. One pending code per user.
 - Approval happens on the machine (`approve.py`) or by an **admin** sending
-  `/approve <code>`. New people are approved as members; use `approve.py <code> --admin` or
-  `/promote <user_id>` to make someone an admin.
+  `/approve <code>` (in a group: `/approve@BotName <code>`, or reply to the bot). New
+  people are approved as members; use `approve.py <code> --admin` or `/promote <user_id>`
+  to make someone an admin.
 - Access is per person, not per chat. An approved person can add the bot to any group and
   use it there; the bot will answer them in that group (members still get chat only).
 - Removing someone: `python3 approve.py --remove <id>`. Removing an id from
@@ -128,6 +145,8 @@ Anyone with it can read your bot's updates and send as your bot. Revoke it in Bo
 
 - **Telegram bot chats are not end-to-end encrypted.** Telegram's servers can read them.
   Don't use this for anything you wouldn't put in a normal Telegram cloud chat.
+- The relay only makes outbound connections (Telegram, the webhook, and the member chat
+  API). There are no inbound ports, tunnels, or Tailscale.
 - Webhook POSTs go over HTTPS to the Grok Bot service.
 - **Media is stored on disk** under `media/<update_id>/` and deleted after 7 days. Anyone
   with access to that machine can read photos and voice notes until then. Transcripts are
