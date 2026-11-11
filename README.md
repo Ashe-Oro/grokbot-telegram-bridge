@@ -21,9 +21,9 @@ You are an existing Grok Bot, often the human's chief-of-staff. Start setup of t
 Brief for the new bot:
 You own the Grok Bot Telegram bridge. Walk the human through setup on this always-on Linux computer. Nothing runs on their laptop or phone; do not deploy to Vercel, Cloudflare, a VPS, or similar. Success: the human can DM the new Telegram bot and get a reply, and can add it to a group and get a reply when they @mention it or reply to it.
 
-Work from docs/SETUP-GUIDE.md, one step at a time. Before the repo is on disk, fetch only the current step's section from https://raw.githubusercontent.com/Ashe-Oro/grokbot-telegram-bridge/main/docs/SETUP-GUIDE.md (no GitHub login). After you download the repo with the public zip or an anonymous git clone (the guide's install step has both; neither needs a GitHub account), read the local file instead. Also read "Rules for secrets" before you collect any credential, and "The two kinds of credentials" before Steps 2 and 3. Confirm each step with the human before moving on, and keep a progress note in memory so you can resume.
+Work from docs/SETUP-GUIDE.md, one step at a time. Before the repo is on disk, fetch only the current step's section from https://raw.githubusercontent.com/Ashe-Oro/grokbot-telegram-bridge/main/docs/SETUP-GUIDE.md (no GitHub login). After you download the repo with the public zip or an anonymous git clone (the guide's install step has both; neither needs a GitHub account), read the local file instead. Also read "Rules for secrets" before you collect any credential, "The two kinds of credentials" before Steps 2 and 3, and "Persist secrets across reboots" when you write those credentials down in Step 5. Confirm each step with the human before moving on, and keep a progress note in memory so you can resume.
 
-Hard rules: ask for every token and key through a hidden secret-request field, never in chat. Never print, log, or commit secrets.
+Hard rules: ask for every token and key through a hidden secret-request field, never in chat. Never print, log, or commit secrets. After each secret is submitted, persist it to the 0600 secrets file as in "Persist secrets across reboots"; a reboot wipes chat-provided environment secrets.
 
 Checklist:
 1. Confirm this chat and your name — https://github.com/Ashe-Oro/grokbot-telegram-bridge/blob/main/docs/SETUP-GUIDE.md#step-1-confirm-this-chat-and-your-name
@@ -144,7 +144,7 @@ Commands go to the bridge, not to the Grok Bot, and only an admin can use them.
 ## Quick start
 
 The usual path is to ask your Grok Bot to do this on its own computer: download
-the repo, fill in `.env`, and run `./start.sh`. You need Python 3.10+ on that
+the repo, persist the secrets, and run `./start.sh`. You need Python 3.10+ on that
 machine, and `ffmpeg` if you want voice notes. Full detail is in
 [docs/SETUP.md](docs/SETUP.md). No GitHub account is needed.
 
@@ -157,19 +157,26 @@ machine, and `ffmpeg` if you want voice notes. Full detail is in
    routine → Webhook. The mobile app does not show them.
 3. **Configure.** Download this repo with the public zip
    (`https://github.com/Ashe-Oro/grokbot-telegram-bridge/archive/refs/heads/main.zip`,
-   via `curl` and `unzip`) or an anonymous `git clone` of the HTTPS URL, then
-   `cp .env.example .env`, `chmod 600 .env`, and fill in
-   `TELEGRAM_BOT_TOKEN`, `GROKBOT_WEBHOOK_URL`, and
-   `GROKBOT_WEBHOOK_KEY`. Put your own Telegram user id in `GROKBOT_ADMINS`
-   (that is how the first admin is set). For member chat, set
-   `GROKBOT_MEMBER_LLM_API_KEY` (an xAI API key by default; any OpenAI-compatible
-   endpoint works). See [.env.example](.env.example) for the rest. For voice
-   notes: `sudo apt install ffmpeg`, then
+   via `curl` and `unzip`) or an anonymous `git clone` of the HTTPS URL. On the
+   Grok Bot computer, secrets from a chat secret-request field live only in the
+   process environment and are wiped by a reboot, so write
+   `TELEGRAM_BOT_TOKEN`, `GROKBOT_WEBHOOK_URL`, `GROKBOT_WEBHOOK_KEY`, and
+   `GROKBOT_MEMBER_LLM_API_KEY` (if you use member chat; an xAI API key by
+   default, any OpenAI-compatible endpoint works) to
+   `/workspace/.secrets/grokbot-telegram.env` (mode 0600, directory 0700).
+   `start.sh` loads that file. Also append `[ -f FILE ] && . FILE` to
+   `~/.bashrc` so interactive sessions have the variables; the keep-alive
+   routine is non-interactive and does not read `.bashrc`. Put your own
+   Telegram user id in `GROKBOT_ADMINS` (that is how the first admin is set;
+   `.env` is still fine for non-secret settings). See
+   [docs/SETUP-GUIDE.md](docs/SETUP-GUIDE.md#persist-secrets-across-reboots)
+   for the exact commands, and [.env.example](.env.example) for the rest of
+   the settings. For voice notes: `sudo apt install ffmpeg`, then
    `python3 -m venv .venv-asr && .venv-asr/bin/pip install -r requirements-asr.txt`.
 4. **Start.** `python3 relay.py --check` then `./start.sh`. Logs go to
    `relay.log`. `./stop.sh` stops it. After a reboot, a scheduled Grok Bot
    routine can run [examples/keepalive-routine.md](examples/keepalive-routine.md)
-   so the bridge comes back.
+   so the bridge comes back on its own, using the secrets file.
 5. **Pair people.** Message the bot; if you are not approved yet it replies
    with a pairing code. Approve with `python3 approve.py <CODE>` (member, the
    default) or, as an admin, `/approve CODE` in Telegram. `/whoami` prints your

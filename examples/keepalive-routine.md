@@ -10,8 +10,12 @@ with the example systemd unit.
 
 ## Setup
 
-1. Install the bridge and fill in `.env` as described in
-   [docs/SETUP.md](../docs/SETUP.md).
+1. Install the bridge and persist secrets to the 0600 secrets file (and hook
+   `~/.bashrc`) as described in
+   [docs/SETUP.md](../docs/SETUP.md) and
+   [docs/SETUP-GUIDE.md](../docs/SETUP-GUIDE.md#persist-secrets-across-reboots).
+   `ensure.sh` calls `start.sh`, which loads that file; the routine itself is
+   non-interactive and will not read `~/.bashrc`.
 2. On the Grok Bot that shares the machine with the bridge, create a scheduled
    routine:
    - **Name:** Telegram bridge keep-alive

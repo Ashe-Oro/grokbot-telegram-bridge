@@ -7,32 +7,37 @@ what you should do about it.
 ## Host trust: processes sharing a Unix user are fully trusted
 
 This bridge is designed for a **private household host**. Every process running as the
-**same Unix user** as the relay is fully trusted. File modes (`chmod 600 .env`) do not
-separate processes that share a UID. Any co-resident Grok Bot agent (or other program)
-with that UID can read `.env` and `state.json`, run `approve.py --add <id> --admin`, write
-to `outbox/`, or call the webhook directly. Telegram pairing and roles do not apply to
-that path.
+**same Unix user** as the relay is fully trusted. File modes (`chmod 600` on `.env`
+or the secrets file) do not separate processes that share a UID. Any co-resident
+Grok Bot agent (or other program) with that UID can read `.env`, the secrets
+file, and `state.json`, run `approve.py --add <id> --admin`, write to
+`outbox/`, or call the webhook directly. Telegram pairing and roles do not apply
+to that path.
 
 Tightening file modes only protects against **other user accounts** on the same machine,
 not against other agents that share this UID. The relay enforces 0700 on runtime data
-directories and 0600 on its runtime files, and warns if `.env` is group- or other-readable.
-It does not change `.env` permissions; keep using `chmod 600 .env`.
+directories and 0600 on its runtime files, and warns if `.env` or the secrets
+file is group- or other-readable (and, for the secrets file, writable or
+owned by another user). It does not change those permissions; keep
+using `chmod 600` on `.env` and on the secrets file.
 
 ### Optional hardening: Run the relay as a separate Unix user
 
 - Create a dedicated user, for example `grokbot-telegram`, that other agents cannot assume
   (no shared login credentials or permission to switch to it).
-- Run the relay under that account, and keep the code, `.env`, `state.json`, and data
-  directory owned by it. Use the host's user-management tools and launch the scripts as
-  that user; systemd is optional.
+- Run the relay under that account, and keep the code, `.env`, the secrets
+  file, `state.json`, and data directory owned by it. Use the host's
+  user-management tools and launch the scripts as that user; systemd is
+  optional.
 - If the receiving Grok Bot runs on a different account, give it narrowly scoped access
   only to `media/` (read) and `outbox/` (write). Use ACLs, or a shared group with modes
   such as 0770 on directories and 0660 on files, including execute on directories so
   the other account can traverse them. The relay resets its managed paths to 0700/0600
   on startup, which will clear those group bits, so re-apply the shared-group or ACL
   grants after start (or adapt the permission helpers for your setup). Default ACLs
-  alone are not enough. Do not grant access to `.env`, state, or code. If both
-  processes share a UID, they are fully trusted and this isolation does not apply.
+  alone are not enough. Do not grant access to `.env`, the secrets file, state,
+  or code. If both processes share a UID, they are fully trusted and this
+  isolation does not apply.
 - Keep approval administration (`approve.py`) on the operator's side, run under the
   relay account through an operator-controlled login.
 
@@ -150,28 +155,47 @@ then gets mentions, replies, and commands, depending on Telegram's rules.
 ## Secrets
 
 - `TELEGRAM_BOT_TOKEN`, `GROKBOT_WEBHOOK_KEY`, and `GROKBOT_MEMBER_LLM_API_KEY` are read
-  only from the environment (or a local `.env` file you create). The relay never writes
-  them to disk.
+  from the environment, from a local `.env` file you create, or from the optional
+  0600 secrets file (`GROKBOT_SECRETS_FILE`, default
+  `/workspace/.secrets/grokbot-telegram.env`). `relay.py` never writes them to disk.
+  On the Grok Bot computer, secrets submitted through a chat secret-request field
+  live only in the process environment and are wiped by a reboot, so the host bot
+  should write those values into the secrets file (see
+  [docs/SETUP-GUIDE.md](docs/SETUP-GUIDE.md#persist-secrets-across-reboots)).
+  `start.sh` sources the file if it is present, keeps any already-set
+  non-empty environment values (so a fresh secret card wins over a stale
+  file), and never echoes its values. It also warns if the file is group- or
+  other-readable or writable, or not owned by the current user, without
+  changing the mode.
+- The secrets file is same-UID trusted: any process running as the relay's Unix
+  user can read it, just as it can read `.env`. Mode 0600 (and 0700 on the
+  directory) only protects the file from other accounts. Source it from
+  `~/.bashrc` if you want the values in interactive shells; that does not help
+  the hourly keep-alive, which is non-interactive and depends on `start.sh`
+  loading the file directly.
 - Log lines are scrubbed: the token, the keys, and any `/bot<id>:<token>` URL pattern are
   replaced with `***`. Telegram file-download URLs contain the token, so they are never
   logged or stored. Download errors log only the error type or HTTP status.
 - Log lines carry no message text, captions, transcripts, or model replies. They record the
   role and path (`webhook` or `member-llm`) and the member call's status.
 - The tests check that a fake token and keys never appear in logs or in any file written.
-- If you use `.env`, `chmod 600 .env`, keep it out of git (it is in `.gitignore`), and
-  prefer your bot's secrets store if it has one.
+- If you use `.env` or the secrets file, `chmod 600` the file, keep it out of git
+  (`*.env` is in `.gitignore`), and do not print it. A bot secrets store that only
+  injects process environment variables is not enough on its own, because a reboot
+  of the Grok Bot computer clears that environment.
 
 ### If the webhook key leaks
 
 Anyone with the URL and key can start runs of your routine with any JSON they like, without
 going through Telegram or the allowlist. That costs you usage and lets them feed the bot
 arbitrary "messages." Rotate the key (or delete and recreate the webhook routine) in the
-Grok Bot desktop app, then update the relay's environment and restart it.
+Grok Bot desktop app, then update the secrets file (or the relay's environment)
+and restart it.
 
 ### If the Telegram token leaks
 
 Anyone with it can read your bot's updates and send as your bot. Revoke it in BotFather
-(`/revoke`), put the new token in the environment, and restart.
+(`/revoke`), put the new token in the secrets file (or the environment), and restart.
 
 ## Transport and storage
 

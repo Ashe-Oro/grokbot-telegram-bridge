@@ -26,7 +26,9 @@ over memory.
 ## How to use this guide
 
 1. Read **Rules for secrets** once, before you collect any credential. Read
-   **The two kinds of credentials** before Steps 2 and 3.
+   **The two kinds of credentials** before Steps 2 and 3. Read
+   **Persist secrets across reboots** before you write any credential down
+   (Step 5, and again if a key is added or rotated later).
 2. For the current checklist item, fetch **only that step's section**. Before
    the repo is on disk, use the public raw file (no GitHub login):
    `https://raw.githubusercontent.com/Ashe-Oro/grokbot-telegram-bridge/main/docs/SETUP-GUIDE.md`
@@ -48,9 +50,12 @@ You are the dedicated bot with only the access Telegram guests should have.
 
 There are several secrets in this setup. For each one, ask through your
 **hidden secret-request field**, never in the chat. Never print, echo, log, or
-commit a token, key, or `.env` value. Don't quote them back to confirm; a short
-"got it, it's set" is enough. If a command's output might contain a secret,
-summarize the error instead of pasting it.
+commit a token, key, `.env` value, or secrets-file value. Don't quote them
+back to confirm; a short "got it, it's set" is enough. If a command's output
+might contain a secret, summarize the error instead of pasting it. Chat
+secret-request fields only set the process environment, which a reboot
+clears; persist each secret as described in
+[Persist secrets across reboots](#persist-secrets-across-reboots).
 
 ## The two kinds of credentials
 
@@ -73,6 +78,93 @@ mobile app: open this bot → Details → Routines → the inbound routine → t
 human can't find that section, show them where it is in this app rather than
 guessing a different click path. The mobile app can show the routine's
 instructions but not the URL or key, so this step needs a computer.
+
+## Persist secrets across reboots
+
+On this computer, values submitted through a hidden secret-request field live
+only in the process environment. A reboot clears that environment, so the
+hourly keep-alive cannot restart the bridge unless the same secrets are also
+on disk.
+
+Do not rely on a shell startup file alone. `~/.bashrc` is only read by
+interactive shells. The keep-alive routine runs non-interactively and does
+not load it. `start.sh` sources the secrets file itself, which is what lets
+the keep-alive recover after a reboot without asking for the keys again.
+Appending a one-line source to `~/.bashrc` is still useful so interactive
+sessions have the same variables.
+
+The default path is `/workspace/.secrets/grokbot-telegram.env`. If you use a
+custom path, set `GROKBOT_SECRETS_FILE` in a place that survives a reboot: the
+repository `.env` (it is not a secret) or the keep-alive routine's start
+command — not only in the process environment. After a reboot, `start.sh`
+falls back to the default path if that override is gone.
+
+The directory should be mode 0700 and the file mode 0600. `start.sh` warns if
+the file is group- or other-readable or writable, or not owned by the current
+user; it does not change the mode, and it never prints the values. Already-set,
+non-empty environment variables win over the file, so a freshly submitted
+secret card is not overwritten by a stale saved copy.
+
+**Threat model.** Every process running as the same Unix user as the relay
+can read this file. That is the same same-UID trust already described in
+[SECURITY.md](../SECURITY.md). File modes only protect against other
+accounts on the machine.
+
+**How to write the file.** After the human submits each secret card — and
+again in Step 5 once you have the set — write the values that are already in
+the environment. Include `TELEGRAM_BOT_TOKEN`, `GROKBOT_WEBHOOK_URL`,
+`GROKBOT_WEBHOOK_KEY`, and `GROKBOT_MEMBER_LLM_API_KEY` if they provided one.
+
+Do **not** source the existing secrets file first. Sourcing it would overwrite
+a newly submitted rotation with the stale saved value. To keep keys you are
+not changing, copy their existing `export` lines through and drop only the
+line for a name you are rewriting from the environment. Write a temporary
+file in the same directory (`umask 077`) and `mv` it over the destination so
+the replacement is atomic. Never cat, echo, log, or open the file in a way
+that would print it.
+
+```bash
+umask 077
+SECRETS_FILE="${GROKBOT_SECRETS_FILE:-/workspace/.secrets/grokbot-telegram.env}"
+mkdir -p "$(dirname "$SECRETS_FILE")"
+chmod 700 "$(dirname "$SECRETS_FILE")"
+tmp="$SECRETS_FILE.tmp.$$"
+# Do not source the existing file. Keep lines for names that are unset in
+# the environment; replace any name that is currently set.
+{
+  if [ -f "$SECRETS_FILE" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      key="${line#export }"
+      key="${key%%=*}"
+      case "$key" in
+        TELEGRAM_BOT_TOKEN) [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && continue ;;
+        GROKBOT_WEBHOOK_URL) [ -n "${GROKBOT_WEBHOOK_URL:-}" ] && continue ;;
+        GROKBOT_WEBHOOK_KEY) [ -n "${GROKBOT_WEBHOOK_KEY:-}" ] && continue ;;
+        GROKBOT_MEMBER_LLM_API_KEY) [ -n "${GROKBOT_MEMBER_LLM_API_KEY:-}" ] && continue ;;
+      esac
+      printf '%s\n' "$line"
+    done < "$SECRETS_FILE"
+  fi
+  [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && printf 'export TELEGRAM_BOT_TOKEN=%q\n' "$TELEGRAM_BOT_TOKEN"
+  [ -n "${GROKBOT_WEBHOOK_URL:-}" ] && printf 'export GROKBOT_WEBHOOK_URL=%q\n' "$GROKBOT_WEBHOOK_URL"
+  [ -n "${GROKBOT_WEBHOOK_KEY:-}" ] && printf 'export GROKBOT_WEBHOOK_KEY=%q\n' "$GROKBOT_WEBHOOK_KEY"
+  [ -n "${GROKBOT_MEMBER_LLM_API_KEY:-}" ] && printf 'export GROKBOT_MEMBER_LLM_API_KEY=%q\n' "$GROKBOT_MEMBER_LLM_API_KEY"
+} > "$tmp"
+chmod 600 "$tmp"
+mv -f "$tmp" "$SECRETS_FILE"
+```
+
+Hook interactive shells once. This does not replace the `start.sh` load:
+
+```bash
+SECRETS_FILE="${GROKBOT_SECRETS_FILE:-/workspace/.secrets/grokbot-telegram.env}"
+# The line added to ~/.bashrc is only a path; it does not print values.
+touch "$HOME/.bashrc"
+grep -Fqs "$SECRETS_FILE" "$HOME/.bashrc" || \
+  printf '\n[ -f %q ] && . %q\n' "$SECRETS_FILE" "$SECRETS_FILE" >> "$HOME/.bashrc"
+```
+
+Do not `source ~/.bashrc` in a way that would dump variables into chat.
 
 ## Step 1: Confirm this chat and your name
 
@@ -197,20 +289,23 @@ and send it only through the hidden secret-request field.
 field, or clearly chosen to skip this and add it later.
 
 **If this step fails.** If they don't have an xAI (or other) key yet, skip
-this step and continue. Member chat can be enabled later by adding
-`GROKBOT_MEMBER_LLM_API_KEY` to `.env` and restarting. Never paste the key
-into chat.
+this step and continue. Member chat can be enabled later by having them
+send the key through a hidden secret-request field, adding
+`GROKBOT_MEMBER_LLM_API_KEY` to the secrets file as in
+[Persist secrets across reboots](#persist-secrets-across-reboots), and
+restarting. Never paste the key into chat.
 
 ## Step 5: Install the bridge on this computer
 
 **Goal.** The repo is on **this** computer (the Grok Bot computer), not on the
-human's laptop, with a locked-down `.env` filled in from the secrets they
-already gave you. No GitHub account or credentials are needed.
+human's laptop, and the secrets they already gave you are written to the
+0600 secrets file so they survive a reboot. No GitHub account or credentials
+are needed.
 
 **Actions.**
 
-Download the public repo, then create `.env`. Prefer the public zip (no git,
-no login):
+Download the public repo, then persist the secrets. Prefer the public zip
+(no git, no login):
 
 ```bash
 curl -fsSL -o /tmp/grokbot-telegram-bridge.zip \
@@ -218,8 +313,6 @@ curl -fsSL -o /tmp/grokbot-telegram-bridge.zip \
 unzip -q /tmp/grokbot-telegram-bridge.zip
 mv grokbot-telegram-bridge-main grokbot-telegram-bridge
 cd grokbot-telegram-bridge
-cp .env.example .env
-chmod 600 .env
 ```
 
 An anonymous `git clone` of the public HTTPS URL is equally fine and also
@@ -228,17 +321,23 @@ needs no GitHub account:
 ```bash
 git clone https://github.com/Ashe-Oro/grokbot-telegram-bridge.git
 cd grokbot-telegram-bridge
-cp .env.example .env
-chmod 600 .env
 ```
 
 Do not use SSH (`git@github.com:...`) and do not pass a GitHub token. If a
 clone asks for credentials, stop and use the zip instead.
 
-Fill in `.env` yourself from the secrets they already gave you
-(`TELEGRAM_BOT_TOKEN`, `GROKBOT_WEBHOOK_URL`, `GROKBOT_WEBHOOK_KEY`, and
-`GROKBOT_MEMBER_LLM_API_KEY` if they provided one). Never cat or otherwise
-print `.env`.
+Then write the secrets file and hook `~/.bashrc` exactly as in
+[Persist secrets across reboots](#persist-secrets-across-reboots), using the
+values already in the environment. Never cat or otherwise print the secrets
+file.
+
+You can still copy `.env.example` to `.env` (`chmod 600 .env`) for
+non-secret settings such as `GROKBOT_ADMINS`. Tokens and keys belong in the
+secrets file on this computer; a chat secret card alone will not survive a
+reboot. `.env` remains supported (`start.sh` still loads it, and existing
+environment variables win over `.env`), but after a reboot that has cleared
+the process environment the keep-alive depends on `start.sh` finding the
+secrets file (or a `.env` you already wrote).
 
 Voice notes can wait until after a text DM works; they're optional and need
 `ffmpeg` plus the `.venv-asr` steps in [SETUP.md](SETUP.md).
@@ -249,15 +348,15 @@ From this point on, read the rest of this guide from the local file
 **Ask the human.** Nothing, unless the download fails or you need them to
 approve a command. You already have the secrets.
 
-**Done when.** The project directory is on this computer, `.env` exists with
-mode 600, the known secrets are written into it, and you did not print the
-file.
+**Done when.** The project directory is on this computer, the secrets file
+exists with mode 600 in a 0700 directory, `~/.bashrc` sources it, the known
+secrets are written into the file, and you did not print the file.
 
 **If this step fails.** If `git clone` asks for a GitHub login or fails with
 an auth error, use the public zip via `curl` and `unzip` instead. If the zip
 URL fails, retry; it is public and does not need an account. Don't put the
-repo on the human's laptop. If you almost printed `.env`, stop and confirm it
-was not pasted into chat.
+repo on the human's laptop. If you almost printed the secrets file or
+`.env`, stop and confirm it was not pasted into chat.
 
 ## Step 6: Start the relay
 
@@ -284,8 +383,10 @@ is false, in which case go back to Step 2 and fix privacy on the correct bot.
 `./start.sh` has started the relay.
 
 **If this step fails.** If `--check` can't reach Telegram, the token may be
-wrong; have them send a fresh token through the hidden field, update `.env`
-without printing it, and rerun `--check`. If
+wrong; have them send a fresh token through the hidden field, update the
+secrets file without printing it (see
+[Persist secrets across reboots](#persist-secrets-across-reboots)), and
+rerun `--check`. If
 `can_read_all_group_messages` is false, disable privacy on the bot whose
 token the relay is using, then continue; a group already joined will also need
 the remove-and-re-add in Step 9. If `start.sh` fails, read `relay.log`
@@ -304,7 +405,10 @@ reboot. This computer's PID 1 is often not systemd, and it may have no cron.
   path to this repo's `ensure.sh` filled in.
 
 If a confirm card appears the first time the routine runs a shell command,
-ask the human to approve it. This is how the bridge comes back after a reboot.
+ask the human to approve it. This is how the bridge comes back after a
+reboot: `ensure.sh` calls `start.sh`, which loads the secrets file even
+though the routine's non-interactive environment does not. That only works
+if you wrote the file in Step 5.
 
 **Ask the human.** To approve the confirm card if one appears the first time
 the routine runs a shell command.
@@ -410,18 +514,20 @@ it. No group lines at all usually means privacy or a re-add is still needed.
 **No reply in a DM after pairing.** Give it up to a minute. Then check
 `relay.log` (it records statuses, not secrets or message text) and that the
 webhook URL and key are set for the inbound routine. A missing or stale key is
-a common cause. Restart with `./stop.sh && ./start.sh` after changing `.env`.
+a common cause. Restart with `./stop.sh && ./start.sh` after updating the
+secrets file (or `.env`).
 
 **`webhook HTTP 401` in the log.** The webhook URL may be right but the key is
 wrong or out of date. Have the human copy the current key from the routine's
 Webhook section in the desktop app, send it again through a hidden
-secret-request field, update `.env` without printing it, and restart the
-relay. A 401 is what we hit the first time the key didn't match.
+secret-request field, update the secrets file without printing it (see
+[Persist secrets across reboots](#persist-secrets-across-reboots)), and
+restart the relay. A 401 is what we hit the first time the key didn't match.
 
 **The first person can't `/approve` in Telegram yet.** That's expected. Until
 you approve them from this computer with `approve.py --admin`, there is no
 admin, and `/approve` in Telegram is admin-only. Do the host-side approval in
 [Step 8](#step-8-approve-the-first-admin-from-the-host).
 
-**Never paste tokens, webhook keys, or `.env` contents into chat** while
-debugging. Summarize errors instead.
+**Never paste tokens, webhook keys, secrets-file contents, or `.env`
+contents into chat** while debugging. Summarize errors instead.

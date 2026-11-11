@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Offline runtime permission tests; no ASR venv, ffmpeg, or network needed."""
-import contextlib, io, json, os, tempfile, unittest
+import contextlib, io, json, os, sys, tempfile, unittest
 from unittest.mock import patch
 import relay
 
@@ -114,6 +114,36 @@ class TestPermissions(unittest.TestCase):
         for path in (relay.HOME, relay.OUTBOX, relay.FAILED, relay.MEDIA):
             self.assert_mode(path, 0o700)
         self.assert_mode(relay.LOCK, 0o600)
+
+class TestTokenCheck(unittest.TestCase):
+    def test_invalid_url_does_not_leak_token(self):
+        import http.client
+        import urllib.request
+        dirty = "123456:unit-test-token-newline\n"
+        with patch.dict(os.environ, TELEGRAM_BOT_TOKEN=dirty, clear=False), \
+             patch.object(urllib.request, "Request", side_effect=http.client.InvalidURL("bad")):
+            with self.assertRaises(relay.TgError) as cm:
+                relay.tg("getMe")
+        msg = str(cm.exception)
+        self.assertIn("invalid token or URL", msg)
+        self.assertNotIn("unit-test-token-newline", msg)
+        self.assertNotIn(dirty.strip(), msg)
+
+    def test_main_strips_token_whitespace_for_check(self):
+        dirty = "  123456:unit-test-token-ws\n"
+        with patch.dict(os.environ, TELEGRAM_BOT_TOKEN=dirty, GROKBOT_WEBHOOK_URL="https://example.invalid/hook",
+                        GROKBOT_WEBHOOK_KEY="unit-test-key", clear=False), \
+             patch.object(sys, "argv", ["relay.py", "--check"]), \
+             patch.object(relay, "tg", return_value={"id": 1, "username": "x", "first_name": "x",
+                                                     "can_read_all_group_messages": True}), \
+             patch.object(relay, "load_dotenv"), \
+             patch.object(relay, "configure_paths"), \
+             patch.object(relay, "secure_runtime"), \
+             patch.object(relay, "seed_allowlist"), \
+             patch.object(relay, "webhook_config", return_value=True), \
+             contextlib.redirect_stdout(io.StringIO()):
+            relay.main()
+            self.assertEqual(os.environ["TELEGRAM_BOT_TOKEN"], "123456:unit-test-token-ws")
 
 if __name__ == "__main__":
     unittest.main()

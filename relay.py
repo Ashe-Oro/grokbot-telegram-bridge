@@ -7,7 +7,7 @@ transcriber.py (faster-whisper in a separate venv) in a long-lived subprocess.
 Configuration comes from environment variables (see .env.example).
 Secrets come only from the environment; nothing secret is logged or saved.
 """
-import base64, collections, fcntl, json, math, os, re, secrets, select, shutil, subprocess, sys, threading, time, urllib.error, urllib.request
+import base64, collections, fcntl, http.client, json, math, os, re, secrets, select, shutil, subprocess, sys, threading, time, urllib.error, urllib.request
 from contextlib import contextmanager
 
 os.umask(0o077)                    # also covers library use and approve.py
@@ -252,14 +252,14 @@ class TgError(Exception):
         self.status, self.desc, self.retry_after = status, desc, retry_after
 
 def tg(method, params=None, timeout=35):
-    token = os.environ["TELEGRAM_BOT_TOKEN"]
-    req = urllib.request.Request(
-        f"https://api.telegram.org/bot{token}/{method}",
-        data=json.dumps(params or {}).encode(),
-        headers={"Content-Type": "application/json"})
+    token = os.environ["TELEGRAM_BOT_TOKEN"].strip()
     try:
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/{method}",
+            data=json.dumps(params or {}).encode(),
+            headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            body = json.loads(r.read())
+            raw = r.read()
     except urllib.error.HTTPError as e:
         try:
             body = json.loads(e.read())
@@ -269,6 +269,14 @@ def tg(method, params=None, timeout=35):
         raise TgError(e.code, body.get("description", "error"), ra) from None
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         raise TgError(0, f"network: {type(e).__name__}") from None
+    except (http.client.InvalidURL, ValueError):
+        # InvalidURL (an HTTPException, not a ValueError, on Python 3.13+)
+        # can include the token-bearing URL. Do not leak it.
+        raise TgError(0, "invalid token or URL") from None
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        raise TgError(0, "invalid response") from None
     if not body.get("ok"):
         raise TgError(200, body.get("description", "not ok"))
     return body["result"]
@@ -869,7 +877,10 @@ def main():
     os.umask(0o077)
     load_dotenv()
     configure_paths()
-    if not os.environ.get("TELEGRAM_BOT_TOKEN"):
+    tok = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+    if tok:
+        os.environ["TELEGRAM_BOT_TOKEN"] = tok
+    if not tok:
         sys.exit("TELEGRAM_BOT_TOKEN is not set")
     secure_runtime()
     seed_allowlist()
@@ -878,6 +889,8 @@ def main():
             me = tg("getMe", timeout=15)
         except TgError as e:
             sys.exit(f"getMe failed: {e}")
+        except (http.client.InvalidURL, ValueError):
+            sys.exit("getMe failed: invalid token or URL")
         print(json.dumps({"id": me["id"], "username": me.get("username"),
                           "name": me.get("first_name"),
                           "can_read_all_group_messages": me.get("can_read_all_group_messages")}))

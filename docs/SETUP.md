@@ -141,9 +141,30 @@ win over it. See [.env.example](../.env.example) for the full list:
 | `GROKBOT_ASR_MODEL` | no | `base.en` (default) or e.g. `small` for multilingual |
 | `GROKBOT_ASR_TIMEOUT` | no | Seconds per transcription (default 180) |
 | `GROKBOT_TYPING_MAX` | no | Seconds to keep refreshing Telegram's "typing..." while a reply is pending (default 180) |
+| `GROKBOT_SECRETS_FILE` | no | Path to a 0600 `export NAME=value` file that `start.sh` sources so secrets survive a reboot (default `/workspace/.secrets/grokbot-telegram.env`) |
 
-If your bot has a secrets store, keep the token and key there and export them into the
-relay's environment instead of writing them to `.env`.
+On the Grok Bot computer, values from a chat secret-request field live only in
+the process environment and are wiped when the machine reboots. After each
+secret is submitted, write `export NAME=<value>` lines into the secrets file
+(mode 0600, directory 0700) with `umask 077` and
+`printf 'export NAME=%q\n' "$NAME"` — never cat or echo the file, and do not
+source the existing file first (that would overwrite a newly submitted
+rotation). Write a temporary file in the same directory and `mv` it over the
+destination, dropping the old line for any name you are replacing. Also append
+`[ -f FILE ] && . FILE` to `~/.bashrc` so interactive sessions see the
+variables. That bashrc hook is not enough by itself: the hourly keep-alive
+routine runs non-interactively and does not read `~/.bashrc`, so `start.sh`
+loads the file directly, with already-set environment values winning over the
+file. Once the file is in place, the keep-alive can bring
+the bridge back after a reboot without asking for the keys again. A custom
+`GROKBOT_SECRETS_FILE` path must be set in `.env` or in the keep-alive
+command, not only in the process environment.
+
+The file is same-UID trusted: any process running as the relay's Unix user can
+read it. See [SECURITY.md](../SECURITY.md) and
+[SETUP-GUIDE.md](SETUP-GUIDE.md#persist-secrets-across-reboots) for the exact
+commands. `.env` is still supported for self-hosting and for non-secret
+settings such as `GROKBOT_ADMINS`.
 
 ### 4. (Optional) Voice notes
 
@@ -308,7 +329,11 @@ scheduled routine. Routines that need a login or an approval will still need you
 - Logs (`relay.log`) carry update ids, user ids, chat types, kinds, sizes, and errors. They
   never carry tokens, keys, message text, captions, or transcripts.
 - `start.sh` launches the supervisor in the background (via `setsid`) and writes its pid
-  to `relay.pid` under `GROKBOT_DATA_DIR` (default: this folder). `stop.sh` signals the
+  to `relay.pid` under `GROKBOT_DATA_DIR` (default: this folder). If
+  `GROKBOT_SECRETS_FILE` (default `/workspace/.secrets/grokbot-telegram.env`)
+  exists, `start.sh` sources it after tightening the data directory, keeping
+  any already-set non-empty environment values, and never
+  prints the values. `stop.sh` signals the
   whole process group and then any leftover relay child of that supervisor.
 - `ensure.sh` is an idempotent health check: if the supervisor is alive it exits 0 and
   prints `ok: running`; otherwise it runs `./start.sh`. It also warns if `ffmpeg` or the
@@ -338,13 +363,18 @@ sudo systemctl enable --now grokbot-telegram-bridge
 
 ```bash
 python3 test_media.py
+python3 test_transcriber.py
+python3 test_permissions.py
+python3 test_start_secrets.py
 ```
 
 Offline tests with a fake token: Telegram, file downloads, and the webhook are mocked. They
 need `ffmpeg` to generate fixtures. The voice tests also need the faster-whisper venv and
 are skipped without it. The role tests mock the chat-model HTTP call and check that member
-messages never reach the webhook. Every test also checks that no token or key reached the
-logs or any file on disk.
+messages never reach the webhook. `test_start_secrets.py` checks that `start.sh` loads a
+temporary 0600 secrets file and warns (without echoing values) if it is group- or
+other-readable; it never reads a real secrets path. Every test also checks that no token
+or key reached the logs or any file on disk.
 
 ## Limitations
 
