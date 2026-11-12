@@ -10,7 +10,7 @@ Audio is decoded with ffmpeg to 16 kHz mono float32 and passed as a numpy array
 (on some PyAV/faster-whisper combinations, passing a file path raises
 "TypeError: open() got an unexpected keyword argument 'metadata_errors'" inside av.open).
 """
-import json, math, os, select, subprocess, sys, time
+import json, math, os, select, subprocess, sys, threading, time
 import numpy as np
 
 MODEL = os.environ.get("GROKBOT_ASR_MODEL") or "base.en"
@@ -21,15 +21,35 @@ if not math.isfinite(MAX_SECONDS) or MAX_SECONDS <= 0 or MAX_PCM_BYTES <= 0:
     raise ValueError("ASR decode limits must be positive and finite")
 
 def decode_argv(path):
-    return ["ffmpeg", "-nostdin", "-v", "error", "-protocol_whitelist", "file,pipe",
-            "-i", path, "-t", str(MAX_SECONDS), "-f", "f32le", "-ac", "1", "-ar", "16000", "-"]
+    return ["ffmpeg", "-v", "error", "-protocol_whitelist", "pipe",
+            "-i", "pipe:0", "-t", str(MAX_SECONDS), "-f", "f32le", "-ac", "1", "-ar", "16000", "-"]
 
 def decode(path):
     argv = decode_argv(path)
     deadline = time.monotonic() + DECODE_TIMEOUT
     data = bytearray()
-    with subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as p:
+    with open(path, "rb") as source, subprocess.Popen(
+            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as p:
+        write_errors = []
+        def feed_input():
+            try:
+                while chunk := source.read(65536):
+                    p.stdin.write(chunk)
+            except BrokenPipeError:
+                # ffmpeg can stop reading early when the duration cap is reached.
+                pass
+            except Exception as exc:
+                write_errors.append(exc)
+            finally:
+                try:
+                    p.stdin.close()
+                except BrokenPipeError:
+                    pass
+
+        writer = threading.Thread(target=feed_input, name="ffmpeg-input")
         try:
+            # Feed input concurrently so a full stdout pipe cannot block decoding.
+            writer.start()
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0 or not select.select([p.stdout], [], [], remaining)[0]:
@@ -49,6 +69,12 @@ def decode(path):
             if p.poll() is None:
                 p.kill()
             p.wait()
+            # Killing ffmpeg releases any blocked stdin write before joining.
+            if writer.ident is not None:
+                writer.join()
+            p.stdin.close()
+        if write_errors:
+            raise write_errors[0]
     return np.frombuffer(data, dtype=np.float32)
 
 def main():

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Offline ffmpeg decode tests; needs numpy and ffmpeg, no Whisper model or venv."""
-import os, subprocess, sys, tempfile, unittest
+import os, subprocess, sys, tempfile, threading, unittest
 from unittest.mock import patch
 import transcriber
 
@@ -22,6 +22,15 @@ class TestDecode(unittest.TestCase):
         self.assertEqual(audio.ndim, 1)
         self.assertAlmostEqual(audio.size, 3 * 16000, delta=160)
 
+    def test_input_and_output_larger_than_pipe_buffers(self):
+        path = os.path.join(self.tmp.name, "sine.wav")
+        subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", self.path,
+                        path], check=True)
+        self.assertGreater(os.path.getsize(path), 65536)
+        audio = transcriber.decode(path)
+        self.assertGreater(audio.nbytes, 65536)
+        self.assertAlmostEqual(audio.size, 3 * 16000, delta=160)
+
     def test_pcm_byte_ceiling(self):
         processes = []
         popen = subprocess.Popen
@@ -35,6 +44,7 @@ class TestDecode(unittest.TestCase):
                 transcriber.decode(self.path)
         self.assertIsNotNone(processes[0].poll())
         self.assertTrue(processes[0].stdout.closed)
+        self.assertTrue(processes[0].stdin.closed)
 
     def test_duration_cap(self):
         with patch.object(transcriber, "MAX_SECONDS", 0.25):
@@ -43,7 +53,10 @@ class TestDecode(unittest.TestCase):
 
     def test_ffmpeg_argv_limits(self):
         argv = transcriber.decode_argv(self.path)
-        self.assertEqual(argv[argv.index("-protocol_whitelist") + 1], "file,pipe")
+        self.assertEqual(argv[argv.index("-protocol_whitelist") + 1], "pipe")
+        self.assertIn(argv[argv.index("-i") + 1], ("pipe:0", "-"))
+        self.assertNotIn(self.path, argv)
+        self.assertNotIn("-nostdin", argv)
         self.assertLess(argv.index("-protocol_whitelist"), argv.index("-i"))
         self.assertGreater(argv.index("-t"), argv.index("-i"))
         self.assertEqual(float(argv[argv.index("-t") + 1]), transcriber.MAX_SECONDS)
@@ -62,9 +75,38 @@ class TestDecode(unittest.TestCase):
                 transcriber.decode(self.path)
         self.assertIsNotNone(processes[0].poll())
         self.assertTrue(processes[0].stdout.closed)
+        self.assertTrue(processes[0].stdin.closed)
+        self.assertFalse(any(t.name == "ffmpeg-input" for t in threading.enumerate()))
+
+    def test_timeout_with_blocked_input_writer(self):
+        path = os.path.join(self.tmp.name, "large-input.ogg")
+        with open(path, "wb") as source:
+            source.write(b"\0" * (2 * 1024 * 1024))
+        with patch.object(transcriber, "DECODE_TIMEOUT", 0.1), \
+             patch.object(transcriber, "decode_argv", return_value=[sys.executable, "-c", "import time; time.sleep(30)"]):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                transcriber.decode(path)
+        self.assertFalse(any(t.name == "ffmpeg-input" for t in threading.enumerate()))
+
+    def test_local_concat_playlist_rejected(self):
+        secret = os.path.join(self.tmp.name, "secret.wav")
+        subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi", "-i",
+                        "sine=frequency=880:duration=1", secret], check=True)
+        playlist = os.path.join(self.tmp.name, "local.ffconcat")
+        with open(playlist, "w") as source:
+            source.write(f"ffconcat version 1.0\nfile '{secret}'\n")
+        with self.assertRaisesRegex(RuntimeError, "ffmpeg decode failed"):
+            transcriber.decode(playlist)
 
     def test_invalid_audio(self):
+        path = os.path.join(self.tmp.name, "invalid.ogg")
+        with open(path, "wb") as source:
+            source.write(b"invalid audio")
         with self.assertRaisesRegex(RuntimeError, "ffmpeg decode failed"):
+            transcriber.decode(path)
+
+    def test_missing_audio(self):
+        with self.assertRaises(FileNotFoundError):
             transcriber.decode(os.path.join(self.tmp.name, "missing.ogg"))
 
 if __name__ == "__main__":
