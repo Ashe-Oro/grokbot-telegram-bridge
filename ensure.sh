@@ -20,12 +20,17 @@ if [ -f .env ]; then
 fi
 DATA_DIR="${GROKBOT_DATA_DIR:-$(pwd)}"
 PID="$DATA_DIR/relay.pid"
-if [ -f "$PID" ] && kill -0 "$(cat "$PID")" 2>/dev/null; then
-  echo "ok: running (pid $(cat "$PID"))"
+. ./pidutil.sh
+if relay_is_running "$PID"; then
+  echo "ok: running (pid $pid)"
   exit 0
 fi
 command -v ffmpeg >/dev/null || echo "warn: ffmpeg missing (voice notes and some media decode will fail); install it with your package manager"
 ASR_PYTHON="${GROKBOT_ASR_PYTHON:-$(pwd)/.venv-asr/bin/python}"
 [ -x "$ASR_PYTHON" ] || echo "warn: ASR venv missing at $ASR_PYTHON"
 echo "relay not running; starting"
-./start.sh
+if [ "${1:-}" = "--pairing-only" ] || [ -f "$DATA_DIR/pairing-only" ] || [ "${GROKBOT_PAIRING_ONLY:-0}" = 1 ]; then
+  ./start.sh --pairing-only
+else
+  ./start.sh
+fi

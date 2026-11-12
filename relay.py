@@ -7,7 +7,7 @@ transcriber.py (faster-whisper in a separate venv) in a long-lived subprocess.
 Configuration comes from environment variables (see .env.example).
 Secrets come only from the environment; nothing secret is logged or saved.
 """
-import base64, collections, fcntl, http.client, json, math, os, re, secrets, select, shutil, subprocess, sys, threading, time, urllib.error, urllib.request
+import base64, collections, fcntl, http.client, json, math, os, re, secrets, select, shutil, stat, subprocess, sys, threading, time, urllib.error, urllib.request
 from contextlib import contextmanager
 
 os.umask(0o077)                    # also covers library use and approve.py
@@ -30,7 +30,7 @@ BOT_NAME = os.environ.get("GROKBOT_BOT_NAME") or "The bot"
 ASR_PY = os.environ.get("GROKBOT_ASR_PYTHON") or os.path.join(CODE_DIR, ".venv-asr", "bin", "python")
 ASR_SCRIPT = os.path.join(CODE_DIR, "transcriber.py")
 ASR_LOAD_TIMEOUT = 180
-ASR_TIMEOUT = int(os.environ.get("GROKBOT_ASR_TIMEOUT") or "180")
+ASR_TIMEOUT = int(os.environ.get("GROKBOT_ASR_TIMEOUT") or "90")
 TYPING_MAX = float(os.environ.get("GROKBOT_TYPING_MAX") or "180")
 _BOT_URL_RE = re.compile(r"/bot[0-9]+:[A-Za-z0-9_-]+")
 
@@ -75,8 +75,23 @@ def private_open(path, mode):
         os.close(fd)
         raise
 
+def atomic_json(path, value, indent=None):
+    tmp = path + ".tmp"
+    with private_open(tmp, "w") as f:
+        json.dump(value, f, ensure_ascii=False, indent=indent)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    fd = os.open(os.path.dirname(path), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
 def secure_runtime():
-    for path in (HOME, OUTBOX, FAILED, MEDIA):
+    for path in (HOME, OUTBOX, FAILED, MEDIA, os.path.join(HOME, "incoming"),
+                 os.path.join(HOME, "incoming", "failed"), os.path.join(HOME, "jobs"),
+                 os.path.join(HOME, "jobs", "failed")):
         private_dir(path)
     # Only media is traversed; do not chmod the code or a shared data tree recursively.
     for root, _, names in os.walk(MEDIA):
@@ -99,7 +114,7 @@ def configure_paths():
     MEDIA = os.path.join(HOME, "media")
     BOT_NAME = os.environ.get("GROKBOT_BOT_NAME") or "The bot"
     ASR_PY = os.environ.get("GROKBOT_ASR_PYTHON") or os.path.join(CODE_DIR, ".venv-asr", "bin", "python")
-    ASR_TIMEOUT = int(os.environ.get("GROKBOT_ASR_TIMEOUT") or "180")
+    ASR_TIMEOUT = int(os.environ.get("GROKBOT_ASR_TIMEOUT") or "90")
     MAX_VOICE_SECONDS = float(os.environ.get("GROKBOT_ASR_MAX_SECONDS") or "600")
     if not math.isfinite(MAX_VOICE_SECONDS) or MAX_VOICE_SECONDS <= 0:
         raise ValueError("ASR duration limit must be positive and finite")
@@ -118,7 +133,7 @@ def log(msg):
 ROLES = ("admin", "member")
 
 def _blank():
-    return {"offset": 0, "allowlist": [], "roles": {}, "pending": {}}
+    return {"offset": 0, "allowlist": [], "roles": {}, "pending": {}, "seen_chats": []}
 
 def _migrate_roles(s):
     """Pre-roles state had only an allowlist (everyone fully trusted). Make the first
@@ -169,11 +184,7 @@ def state(write=True):
         yield s
         _sync(s)
         if write:
-            tmp = STATE + ".tmp"
-            with private_open(tmp, "w") as f:
-                json.dump(s, f, indent=2)
-                os.fchmod(f.fileno(), 0o600)
-            os.replace(tmp, STATE)
+            atomic_json(STATE, s, indent=2)
 
 def parse_allowlist(raw, var="GROKBOT_ALLOWLIST"):
     """Parse a comma/space separated list of numeric Telegram user ids."""
@@ -188,7 +199,7 @@ def parse_allowlist(raw, var="GROKBOT_ALLOWLIST"):
 
 def seed_allowlist(raw=None, admins_raw=None):
     """Seed users from the environment (never removes anyone, never demotes anyone).
-    GROKBOT_ADMINS ids become admin; GROKBOT_ALLOWLIST ids are added as member."""
+    Only missing ids are added: GROKBOT_ADMINS as admin, GROKBOT_ALLOWLIST as member."""
     admins = parse_allowlist(os.environ.get("GROKBOT_ADMINS") if admins_raw is None else admins_raw,
                              "GROKBOT_ADMINS")
     ids = parse_allowlist(os.environ.get("GROKBOT_ALLOWLIST") if raw is None else raw)
@@ -197,7 +208,7 @@ def seed_allowlist(raw=None, admins_raw=None):
     added = 0
     with state() as s:
         for uid in admins:
-            if role_of(s, uid) != "admin":
+            if role_of(s, uid) is None:
                 s["roles"][str(uid)] = "admin"; added += 1
         for uid in ids:
             if role_of(s, uid) is None:
@@ -210,12 +221,14 @@ def seed_allowlist(raw=None, admins_raw=None):
             "Set GROKBOT_ADMINS or run: python3 approve.py --role <user_id> admin")
     return added
 
-def approve_code(code, role="member"):
+def approve_code(code, role="member", actor=None):
     """Approve a pending code's user with a role (default member; an existing role is only
     changed if role is given explicitly as admin). Returns the pending dict or None."""
     assert role in ROLES
     code = code.strip().upper()
     with state() as s:
+        if actor is not None and role_of(s, actor) != "admin":
+            raise PermissionError(ADMIN_ONLY_REPLY)
         p = s["pending"].pop(code, None)
         if p:
             cur = role_of(s, p["user_id"])
@@ -223,10 +236,12 @@ def approve_code(code, role="member"):
             p["role"] = s["roles"][str(p["user_id"])]
         return p
 
-def set_role(uid, role):
+def set_role(uid, role, actor=None):
     """Set an approved user's role. Returns (ok, message). Refuses to remove the last admin."""
     assert role in ROLES
     with state() as s:
+        if actor is not None and role_of(s, actor) != "admin":
+            return False, ADMIN_ONLY_REPLY
         cur = role_of(s, uid)
         if cur is None:
             return False, f"User {uid} isn't approved yet. Approve their pairing code first."
@@ -281,13 +296,26 @@ def tg(method, params=None, timeout=35):
         raise TgError(200, body.get("description", "not ok"))
     return body["result"]
 
-def send_text(chat_id, text, reply_to=None):
+def send_text(chat_id, text, reply_to=None, progress=None):
     for i in range(0, max(len(text), 1), MAX_TEXT):
         p = {"chat_id": chat_id, "text": text[i:i + MAX_TEXT]}
         if reply_to and i == 0:
             p["reply_to_message_id"] = reply_to
             p["allow_sending_without_reply"] = True
         tg("sendMessage", p, timeout=20)
+        if progress:
+            progress(min(i + MAX_TEXT, len(text)))
+        remember_chat(chat_id)
+
+def remember_chat(chat_id):
+    with state() as s:
+        if int(chat_id) not in s["seen_chats"]:
+            s["seen_chats"].append(int(chat_id))
+
+def outbox_chat_allowed(chat_id):
+    extra = parse_allowlist(os.environ.get("GROKBOT_OUTBOX_CHATS"), "GROKBOT_OUTBOX_CHATS")
+    with state(write=False) as s:
+        return chat_id in s["seen_chats"] or role_of(s, chat_id) is not None or chat_id in extra
 
 def chat_action(chat_id, action="typing"):
     try:
@@ -379,12 +407,26 @@ def cleanup_media(now=None):
     if not os.path.isdir(MEDIA):
         return 0
     removed = 0
+    items = []
     for name in os.listdir(MEDIA):
         p = os.path.join(MEDIA, name)
         try:
-            if now - os.path.getmtime(p) > MEDIA_TTL:
-                shutil.rmtree(p) if os.path.isdir(p) else os.remove(p)
-                removed += 1
+            if name.isdigit() and int(name) in JOB_ACTIVE:
+                continue
+            size = sum(os.path.getsize(os.path.join(root, f)) for root, _, files in os.walk(p)
+                       for f in files if not os.path.islink(os.path.join(root, f))) if os.path.isdir(p) else os.lstat(p).st_size
+            items.append((os.lstat(p).st_mtime, p, size))
+        except OSError:
+            pass
+    total = sum(size for _, _, size in items)
+    quota = env_limit("GROKBOT_MEDIA_MAX_BYTES", 512 * 1024 * 1024)
+    for modified, p, size in sorted(items):
+        if now - modified <= MEDIA_TTL and total <= quota:
+            continue
+        try:
+            shutil.rmtree(p) if os.path.isdir(p) and not os.path.islink(p) else os.unlink(p)
+            total -= size
+            removed += 1
         except OSError:
             pass
     if removed:
@@ -445,7 +487,12 @@ class Transcriber:
 TRANSCRIBER = Transcriber()
 
 # ---------- webhook ----------
+def pairing_only():
+    return os.environ.get("GROKBOT_PAIRING_ONLY") == "1"
+
 def webhook_config():
+    if pairing_only():
+        return None
     url, key = os.environ.get("GROKBOT_WEBHOOK_URL"), os.environ.get("GROKBOT_WEBHOOK_KEY")
     return (url, key) if url and key else None
 
@@ -455,8 +502,13 @@ def forward(event):
         log(f"webhook not configured; not forwarding update_id={event['update_id']}")
         return False
     url, key = cfg
-    req = urllib.request.Request(url, data=json.dumps(event).encode(), method="POST",
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"})
+    try:
+        req = urllib.request.Request(url, data=json.dumps(event).encode(), method="POST",
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}",
+                     "Idempotency-Key": f"telegram:{event['update_id']}"})
+    except (ValueError, http.client.InvalidURL):
+        log(f"webhook invalid URL update_id={event['update_id']}")
+        return False
     for attempt in range(3):
         try:
             with urllib.request.urlopen(req, timeout=20) as r:
@@ -471,13 +523,102 @@ def forward(event):
         time.sleep(2 ** attempt)
     return False
 
+INCOMING_MAX = 1000
+INCOMING_ATTEMPTS = 10
+
+@contextmanager
+def incoming_lock():
+    directory = os.path.join(HOME, "incoming")
+    private_dir(directory)
+    private_dir(os.path.join(directory, "failed"))
+    with private_open(os.path.join(directory, ".lock"), "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield directory
+
+def incoming_notice(event, text):
+    try:
+        send_text(event["chat_id"], text, event.get("message_id"))
+    except Exception as e:
+        log(f"incoming notice failed update_id={event['update_id']}: {type(e).__name__}")
+
+def deliver_incoming(path, record):
+    event = record["event"]
+    if pairing_only():
+        return False
+    with state(write=False) as s:
+        role = role_of(s, event["user_id"])
+    if role == "member":
+        slot = job_slot("member")
+        if not slot.acquire(blocking=False):
+            return False
+        try:
+            member_event_reply(event)
+            os.unlink(path)
+            typing_stop(f"{event['update_id']}.json")
+            return True
+        finally:
+            slot.release()
+    if role != "admin":
+        log(f"incoming authorization revoked update_id={event['update_id']}; removed")
+        _rm(path)
+        typing_stop(f"{event['update_id']}.json")
+        return False
+    if forward(event):
+        os.unlink(path)
+        return True
+    record["attempts"] += 1
+    typing_stop(f"{event['update_id']}.json")
+    if record["attempts"] >= INCOMING_ATTEMPTS or time.time() - record["created"] > 86400:
+        atomic_json(path, record)
+        os.replace(path, os.path.join(os.path.dirname(path), "failed", os.path.basename(path)))
+        incoming_notice(event, "Webhook delivery failed permanently. Please ask the owner to inspect incoming/failed/.")
+        log(f"incoming exhausted update_id={event['update_id']}; moved to failed/")
+    else:
+        record["next_attempt"] = time.time() + min(300, 5 * 2 ** record["attempts"])
+        atomic_json(path, record)
+        if record["attempts"] == 1:
+            incoming_notice(event, "I couldn't deliver that message to the webhook. It's saved and I'll retry.")
+    return False
+
+def queue_admin_event(event):
+    with incoming_lock() as directory:
+        path = os.path.join(directory, f"{event['update_id']}.json")
+        if os.path.exists(path):
+            return
+        if sum(n.endswith(".json") for n in os.listdir(directory)) >= INCOMING_MAX:
+            incoming_notice(event, "The incoming queue is full. Please try again later.")
+            raise RuntimeError("incoming queue full")
+        record = {"event": event, "created": time.time(), "attempts": 0, "next_attempt": 0}
+        atomic_json(path, record)
+        deliver_incoming(path, record)
+
+def drain_incoming_once():
+    if pairing_only():
+        return
+    slot = job_slot("admin")
+    if not slot.acquire(blocking=False):
+        return
+    try:
+        with incoming_lock() as directory:
+            for name in sorted(os.listdir(directory)):
+                if not name.endswith(".json"):
+                    continue
+                path = os.path.join(directory, name)
+                with open(path) as f:
+                    record = json.load(f)
+                if record["next_attempt"] <= time.time():
+                    deliver_incoming(path, record)
+    finally:
+        slot.release()
+
 # ---------- member chat (hard sandbox) ----------
 # Members never reach the Grok Bot webhook (that agent has tools and a shell). Their messages
 # go to a plain chat-completion call: no tools, no function calling, no files, no shell.
 MEMBER_HISTORY_MAX = 10
-MEMBER_HISTORY = collections.defaultdict(lambda: collections.deque(maxlen=MEMBER_HISTORY_MAX))
+MEMBER_HISTORY = collections.OrderedDict()
 MEMBER_HISTORY_LOCK = threading.Lock()
-MEMBER_THREADED = True          # tests set False to run replies inline
+MEMBER_THREADED = True          # tests set False to handle all work inline
+MEMBER_HISTORY_CHATS = 128
 VISION_MIME = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png"}
 NO_KEY_REPLY = "I'm only set up to chat with admins right now."
 LLM_FAIL_REPLY = "Sorry, I couldn't come up with a reply just now. Please try again in a bit."
@@ -518,6 +659,12 @@ def _post_chat(cfg, payload):
     with urllib.request.urlopen(req, timeout=cfg["timeout"]) as r:
         return json.loads(r.read())
 
+def env_limit(name, default):
+    return max(1, int(os.environ.get(name) or default))
+
+def vision_limit():
+    return env_limit("GROKBOT_VISION_MAX_BYTES", 4 * 1024 * 1024)
+
 def member_reply_text(chat_id, first_name, text, image_path=None):
     """Return (reply, status). Never raises. Only text in, text out; no tools are offered."""
     cfg = member_llm_config()
@@ -526,15 +673,19 @@ def member_reply_text(chat_id, first_name, text, image_path=None):
     who = (first_name or "Someone").strip()[:40]
     turn = f"{who}: {text}" if text else f"{who}: (no text)"
     with MEMBER_HISTORY_LOCK:
-        history = list(MEMBER_HISTORY[chat_id])
+        history = list(MEMBER_HISTORY.get(chat_id, ()))
     content = turn
     if image_path and cfg["vision"]:
         mime = VISION_MIME.get(os.path.splitext(image_path)[1].lower())
         if mime:
             with open(image_path, "rb") as f:
-                b64 = base64.b64encode(f.read()).decode()
-            content = [{"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
-                       {"type": "text", "text": turn}]
+                data = f.read(vision_limit() + 1)
+            if len(data) <= vision_limit():
+                b64 = base64.b64encode(data).decode()
+                content = [{"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+                           {"type": "text", "text": turn}]
+            else:
+                content = "[sent a photo I can't view] " + turn
     messages = [{"role": "system", "content": member_system_prompt()}] + history + \
                [{"role": "user", "content": content}]
     payload = {"model": cfg["model"], "messages": messages, "stream": False, "max_tokens": 800}
@@ -548,15 +699,26 @@ def member_reply_text(chat_id, first_name, text, image_path=None):
     except Exception as e:
         return LLM_FAIL_REPLY, type(e).__name__
     with MEMBER_HISTORY_LOCK:
-        h = MEMBER_HISTORY[chat_id]
+        h = MEMBER_HISTORY.pop(chat_id, collections.deque(maxlen=MEMBER_HISTORY_MAX))
         h.append({"role": "user", "content": turn if not image_path else f"{who}: [sent a photo] {text}".rstrip()})
         h.append({"role": "assistant", "content": reply[:4000]})
+        MEMBER_HISTORY[chat_id] = h
+        while len(MEMBER_HISTORY) > env_limit("GROKBOT_MEMBER_HISTORY_CHATS", MEMBER_HISTORY_CHATS):
+            MEMBER_HISTORY.popitem(last=False)
     return reply, "ok"
 
-def _member_job(upd_id, chat_id, mid, first_name, text, image_path, name):
+def _member_job(upd_id, chat_id, mid, first_name, text, image_path, name, uid=None):
     t0 = time.time()
     try:
+        if uid is not None:
+            with state(write=False) as s:
+                if role_of(s, uid) is None:
+                    return
         reply, status = member_reply_text(chat_id, first_name, text, image_path)
+        if uid is not None:
+            with state(write=False) as s:
+                if role_of(s, uid) is None:
+                    return
         try:
             send_text(chat_id, reply, mid)
         except TgError as e:
@@ -567,11 +729,115 @@ def _member_job(upd_id, chat_id, mid, first_name, text, image_path, name):
     finally:
         typing_stop(name)
 
+def member_event_reply(event):
+    text = event["text"].replace("; the audio file is at media_path", "")
+    path = event.get("media_path") if event.get("kind") == "photo" else None
+    if path and not (os.path.isfile(path) and os.path.getsize(path) <= vision_limit() and
+                     member_llm_config()["vision"] and VISION_MIME.get(os.path.splitext(path)[1].lower())):
+        text = "[sent a photo I can't view] " + text
+        path = None
+    name = f"member-{event['update_id']}"
+    typing_start(name, event["chat_id"])
+    _member_job(event["update_id"], event["chat_id"], event.get("message_id"),
+                event.get("first_name"), text, path, name, event["user_id"])
+
 def run_member_job(*args):
-    if MEMBER_THREADED:
-        threading.Thread(target=_member_job, args=args, daemon=True).start()
-    else:
-        _member_job(*args)
+    _member_job(*args)          # handle() already owns a bounded worker slot
+
+# Durable admission keeps slow work off the polling thread.
+JOB_LOCK = threading.RLock()
+JOB_ACTIVE = set()
+JOB_POOLS = {}
+JOB_MAX = 1000
+
+def job_slot(lane):
+    with JOB_LOCK:
+        if lane not in JOB_POOLS:
+            JOB_POOLS[lane] = threading.BoundedSemaphore(env_limit(
+                "GROKBOT_MEMBER_JOBS" if lane == "member" else "GROKBOT_ADMIN_WORKERS", 2))
+        return JOB_POOLS[lane]
+
+def jobs_dir():
+    directory = os.path.join(HOME, "jobs")
+    private_dir(directory)
+    private_dir(os.path.join(directory, "failed"))
+    return directory
+
+def queue_update(bot, upd):
+    with JOB_LOCK:
+        directory = jobs_dir()
+        uid = upd["update_id"]
+        path = os.path.join(directory, f"{uid}.json")
+        with state(write=False) as s:
+            done = uid in s.get("completed_updates", [])
+        if done or uid in JOB_ACTIVE or os.path.exists(path):
+            return
+        if sum(n.endswith(".json") for n in os.listdir(directory)) >= JOB_MAX:
+            raise RuntimeError("work queue full")
+        if len(json.dumps(upd).encode()) > OUTBOX_MAX_BYTES:
+            raise ValueError("oversized update")
+        atomic_json(path, {"update": upd, "attempts": 0, "next_attempt": 0})
+    dispatch_jobs(bot)
+
+def _update_job(bot, path, record, slot):
+    uid = record["update"]["update_id"]
+    try:
+        bot._handle(record["update"])
+        with state() as s:
+            s["completed_updates"] = (s.get("completed_updates", []) + [uid])[-2048:]
+        os.unlink(path)
+    except Exception as e:
+        log(f"worker error update_id={uid}: {type(e).__name__}")
+        record["attempts"] += 1
+        record["next_attempt"] = time.time() + 30
+        atomic_json(path, record)
+        if record["attempts"] >= 10:
+            os.replace(path, os.path.join(os.path.dirname(path), "failed", os.path.basename(path)))
+            msg = record["update"].get("message") or {}
+            incoming_notice({"update_id": uid, "chat_id": msg["chat"]["id"],
+                             "message_id": msg.get("message_id")},
+                            "I couldn't process that message. Please ask the owner to inspect jobs/failed/.")
+    finally:
+        try:
+            cleanup_media()
+        except Exception as e:
+            log(f"media cleanup error: {type(e).__name__}")
+        with JOB_LOCK:
+            JOB_ACTIVE.discard(uid)
+            slot.release()
+
+def dispatch_jobs(bot):
+    with JOB_LOCK:
+        directory = jobs_dir()
+        for name in sorted(os.listdir(directory)):
+            if not name.endswith(".json"):
+                continue
+            uid = int(name[:-5])
+            if uid in JOB_ACTIVE:
+                continue
+            path = os.path.join(directory, name)
+            with open(path) as f:
+                record = json.load(f)
+            if record["next_attempt"] > time.time():
+                continue
+            user = (record["update"].get("message") or {}).get("from") or {}
+            with state(write=False) as s:
+                role = role_of(s, user.get("id"))
+            lane = "member" if role == "member" else "admin"
+            slot = job_slot(lane)
+            if not slot.acquire(blocking=False):
+                continue
+            JOB_ACTIVE.add(uid)
+            threading.Thread(target=_update_job, args=(bot, path, record, slot),
+                             name=f"bridge-job-{uid}", daemon=True).start()
+
+def job_loop(bot):
+    while True:
+        try:
+            dispatch_jobs(bot)
+        except Exception as e:
+            log(f"job loop error: {type(e).__name__}")
+        time.sleep(1)
 
 # ---------- inbound handling ----------
 def is_forwarded(msg):
@@ -620,11 +886,29 @@ class Bot:
                 s["pending"][code] = {"user_id": uid, "username": user.get("username"),
                                       "first_name": user.get("first_name"),
                                       "chat_id": msg["chat"]["id"], "created": time.time()}
+            pending = s["pending"][code]
+            now = time.time()
+            if now - pending.get("last_reply", 0) < 60:
+                log(f"pairing cooldown user_id={uid}; skipped")
+                return
+            pending["last_reply"] = now
         log(f"pairing code issued user_id={uid}")
         send_text(msg["chat"]["id"], "This bot is private. To request access, ask the owner to "
                   f"approve pairing code: {code}", msg.get("message_id"))
 
     def handle(self, upd):
+        msg = upd.get("message") or {}
+        text = msg.get("text") or ""
+        verb = text.strip().split(maxsplit=1)[0].split("@")[0].lower() if text.strip() else ""
+        user = msg.get("from") or {}
+        with state(write=False) as s:
+            role = role_of(s, user.get("id"))
+        if MEMBER_THREADED and role is not None and verb not in ("/approve", "/promote", "/demote", "/whoami"):
+            queue_update(self, upd)
+        else:
+            self._handle(upd)
+
+    def _handle(self, upd):
         msg = upd.get("message")
         if not msg:
             return
@@ -640,7 +924,9 @@ class Bot:
         if not is_dm and not (ctype in ("group", "supergroup") and self.addressed(msg)):
             log(f"update_id={upd['update_id']} user_id={uid} chat_type={ctype} not addressed; ignored")
             return
-        with state(write=False) as s:
+        with state() as s:
+            if chat["id"] not in s["seen_chats"]:
+                s["seen_chats"].append(chat["id"])
             role = role_of(s, uid)
         allowed = role is not None
         kind = media["kind"] if media else "text"
@@ -662,7 +948,11 @@ class Bot:
                           "them yourself, not from a forwarded message.", mid)
                 return
             if verb == "/approve":
-                p = approve_code(cmd[1]) if len(cmd) > 1 else None
+                try:
+                    p = approve_code(cmd[1], actor=uid) if len(cmd) > 1 else None
+                except PermissionError:
+                    send_text(chat["id"], ADMIN_ONLY_REPLY, mid)
+                    return
                 send_text(chat["id"], f"Approved user {p['user_id']} as {p['role']}." if p else
                           "Usage: /approve <code> (code unknown or expired)", mid)
                 if p:
@@ -673,7 +963,7 @@ class Bot:
                 send_text(chat["id"], f"Usage: {verb} <user_id>", mid)
                 return
             new = "admin" if verb == "/promote" else "member"
-            ok, note = set_role(int(target), new)
+            ok, note = set_role(int(target), new, actor=uid)
             send_text(chat["id"], note, mid)
             log(f"{verb[1:]} user_id={target} ok={ok} by user_id={uid}")
             return
@@ -695,14 +985,21 @@ class Bot:
         if media and not self.prepare_media(upd, msg, media, event):
             typing_stop(name)
             return
-        log(f"update_id={upd['update_id']} role=admin path=webhook")
-        ok = forward(event)
-        if not ok:
+        with state(write=False) as s:
+            current = role_of(s, uid)
+        if current != "admin":
             typing_stop(name)
-        if not ok and webhook_config() is None:
+            if current == "member":
+                self.handle_member(upd, msg, user, chat, text, media, kind, prepared=event)
+            return
+        log(f"update_id={upd['update_id']} role=admin path=webhook")
+        if webhook_config() is None:
+            typing_stop(name)
             send_text(chat["id"], f"{BOT_NAME} isn't connected yet. Try again later.", msg.get("message_id"))
+            return
+        queue_admin_event(event)
 
-    def handle_member(self, upd, msg, user, chat, text, media, kind):
+    def handle_member(self, upd, msg, user, chat, text, media, kind, prepared=None):
         """Members never reach the webhook. The relay answers them itself (chat only)."""
         uidd, mid = upd["update_id"], msg.get("message_id")
         log(f"update_id={uidd} role=member path=member-llm kind={kind}")
@@ -710,19 +1007,24 @@ class Bot:
         typing_start(name, chat["id"])
         image_path = None
         if media:
-            ev = {"text": text}
-            if not self.prepare_media(upd, msg, media, ev):
+            ev = prepared if prepared is not None else {"text": text}
+            if prepared is None and not self.prepare_media(upd, msg, media, ev):
                 typing_stop(name)
                 return
             if media["kind"] == "photo":
                 image_path = ev["media_path"]
-                if not (member_llm_config()["vision"] and
+                if not (member_llm_config()["vision"] and os.path.getsize(image_path) <= vision_limit() and
                         VISION_MIME.get(os.path.splitext(image_path)[1].lower())):
                     text = "[sent a photo I can't view]" + (f" {text}" if text else "")
                     image_path = None
             else:
                 text = ev["text"].replace("; the audio file is at media_path", "")
-        run_member_job(uidd, chat["id"], mid, user.get("first_name"), text, image_path, name)
+        with state(write=False) as s:
+            current = role_of(s, user["id"])
+        if current is None:
+            typing_stop(name)
+            return
+        run_member_job(uidd, chat["id"], mid, user.get("first_name"), text, image_path, name, user["id"])
 
     def prepare_media(self, upd, msg, media, event):
         """Download (and for voice, transcribe) the attachment into event. False = stop."""
@@ -791,7 +1093,9 @@ class Bot:
                 try:
                     self.handle(upd)
                 except Exception as e:
-                    log(f"handler error update_id={upd.get('update_id')}: {type(e).__name__} {e}")
+                    log(f"handler error update_id={upd.get('update_id')}: {type(e).__name__}")
+                    time.sleep(1)
+                    break
                 with state() as s:
                     s["offset"] = max(s["offset"], upd["update_id"] + 1)
 
@@ -822,39 +1126,103 @@ def typing_loop():
             chat_action(c, "typing")
 
 # ---------- outbox ----------
+OUTBOX_MAX_BYTES = 1024 * 1024
+
+def fail_outbox(path, name, reason):
+    typing_stop(name)
+    log(f"outbox rejected {name}: {reason}; moved to failed/")
+    try:
+        os.replace(path, os.path.join(FAILED, name))
+    except OSError:
+        _rm(path)
+
 def drain_outbox_once():
-    for name in sorted(os.listdir(OUTBOX)):
-        if not name.endswith(".json"):
-            continue
-        path = os.path.join(OUTBOX, name)
+    with private_open(os.path.join(OUTBOX, ".drain.lock"), "a") as lock:
         try:
-            if time.time() - os.path.getmtime(path) < 0.5:
-                continue  # may still be being written
-            with open(path) as f:
-                r = json.load(f)
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        _drain_outbox_locked()
+
+def _drain_outbox_locked():
+    for entry in sorted(os.listdir(OUTBOX)):
+        if not (entry.endswith(".json") or entry.endswith(".json.work")):
+            continue
+        name = entry[:-5] if entry.endswith(".work") else entry
+        path = os.path.join(OUTBOX, entry)
+        fd = None
+        try:
+            info = os.lstat(path)
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError("non-regular file")
+            if time.time() - info.st_mtime < 0.5:
+                continue
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > OUTBOX_MAX_BYTES:
+                raise ValueError("non-regular or oversized file")
+            work = os.path.join(OUTBOX, name + ".work")
+            if path != work and os.path.lexists(work):
+                raise ValueError("duplicate entry already claimed")
+            os.replace(path, work)
+            path = work
+            claimed = os.lstat(path)
+            if (claimed.st_dev, claimed.st_ino) != (info.st_dev, info.st_ino):
+                raise ValueError("file changed during claim")
+            with os.fdopen(fd, "rb") as f:
+                fd = None
+                raw = f.read(OUTBOX_MAX_BYTES + 1)
+            if len(raw) > OUTBOX_MAX_BYTES:
+                raise ValueError("oversized file")
+            r = json.loads(raw)
             chat_id, text = int(r["chat_id"]), str(r["text"])
-            if not text.strip():
-                raise ValueError("empty text")
+            if not text.strip() or len(text) > OUTBOX_MAX_BYTES:
+                raise ValueError("empty or oversized text")
         except FileNotFoundError:
             continue
         except Exception as e:
-            typing_stop(name)
-            log(f"outbox bad file {name}: {type(e).__name__}; moved to failed/")
-            os.replace(path, os.path.join(FAILED, name))
+            fail_outbox(path, name, type(e).__name__)
             continue
+        finally:
+            if fd is not None:
+                os.close(fd)
+        if not outbox_chat_allowed(chat_id):
+            fail_outbox(path, name, "unknown chat_id")
+            continue
+        retry_at = r.get("next_attempt", 0)
+        if type(retry_at) not in (int, float) or (type(retry_at) is float and not math.isfinite(retry_at)):
+            fail_outbox(path, name, "invalid next_attempt")
+            continue
+        if retry_at > time.time():
+            continue
+        sent = r.get("sent_chars", 0)
+        if type(sent) is not int or not 0 <= sent <= len(text):
+            fail_outbox(path, name, "invalid sent_chars")
+            continue
+        def progress(count):
+            r["sent_chars"] = sent + count
+            atomic_json(path, r)
         try:
-            send_text(chat_id, text, r.get("reply_to_message_id"))
+            if sent < len(text):
+                send_text(chat_id, text[sent:], r.get("reply_to_message_id") if not sent else None, progress)
             typing_stop(name)
             os.remove(path)
             log(f"sent reply {name} chat_id={chat_id}")
         except TgError as e:
             if e.status == 429 or e.status == 0 or e.status >= 500:
                 log(f"reply {name} deferred: {e}")
-                time.sleep(e.retry_after or 5)
+                r["next_attempt"] = time.time() + (e.retry_after or 5)
+                atomic_json(path, r)
                 return
-            typing_stop(name)
-            log(f"reply {name} failed: {e}; moved to failed/")
-            os.replace(path, os.path.join(FAILED, name))
+            fail_outbox(path, name, f"Telegram {e.status}")
+
+def incoming_loop():
+    while True:
+        try:
+            drain_incoming_once()
+        except Exception as e:
+            log(f"incoming loop error: {type(e).__name__}")
+        time.sleep(1)
 
 def outbox_loop():
     while True:
@@ -863,7 +1231,7 @@ def outbox_loop():
         except Exception as e:
             log(f"outbox loop error: {type(e).__name__}")
         global _last_cleanup
-        if time.time() - _last_cleanup > 6 * 3600:
+        if time.time() - _last_cleanup > 60:
             _last_cleanup = time.time()
             try:
                 cleanup_media()
@@ -894,7 +1262,7 @@ def main():
         print(json.dumps({"id": me["id"], "username": me.get("username"),
                           "name": me.get("first_name"),
                           "can_read_all_group_messages": me.get("can_read_all_group_messages")}))
-        print("webhook configured:", bool(webhook_config()))
+        print("pairing-only:", pairing_only(), "webhook configured:", bool(webhook_config()))
         return
     while True:
         try:
@@ -903,10 +1271,13 @@ def main():
         except TgError as e:
             log(f"getMe failed: {e}; retrying in 30s")
             time.sleep(30)
+    log(f"pairing-only={pairing_only()}; webhook disabled={pairing_only()}")
     log(f"started as @{bot.username} id={bot.id}; webhook configured={bool(webhook_config())}; "
         f"member llm key set={bool(member_llm_key())} model={member_llm_config()['model']}")
     threading.Thread(target=outbox_loop, daemon=True).start()
+    threading.Thread(target=incoming_loop, daemon=True).start()
     threading.Thread(target=typing_loop, daemon=True).start()
+    threading.Thread(target=job_loop, args=(bot,), daemon=True).start()
     bot.poll_forever()
 
 if __name__ == "__main__":

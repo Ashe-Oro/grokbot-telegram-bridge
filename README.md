@@ -96,6 +96,10 @@ sequenceDiagram
 - **Mention or reply in groups.** The bridge answers a group message only when
   someone @mentions the bot or replies to it, and only if that person is
   approved.
+- **Bounded work and durable delivery.** Heavy work uses two admin and two member
+  slots by default. Webhook failures stay queued for retry with a stable idempotency
+  key; the receiver must suppress duplicates before starting tools. See
+  [delivery and resource limits](docs/SETUP.md#delivery-and-resource-limits).
 - **Allowlist and pairing codes.** Strangers get a short code, not access. You
   approve them on the machine or with `/approve` in Telegram.
 - **Admin and member roles, with a hard boundary.** See [Roles](#roles) below.
@@ -112,7 +116,8 @@ sequenceDiagram
 ## Roles
 
 The person who hosts the bot sets the first admin — put your Telegram user id in
-`GROKBOT_ADMINS` when you configure it, or approve your own pairing code with
+`GROKBOT_ADMINS` when you configure it (bootstrap only; existing roles survive
+restarts), or approve your own pairing code with
 `python3 approve.py <CODE> --admin`. The first person to message the bot is
 **not** made an admin automatically. Everyone else is approved as a **member**.
 You can change a role later.

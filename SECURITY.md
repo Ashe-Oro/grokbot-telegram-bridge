@@ -98,8 +98,9 @@ Details:
   processes, create routines, change settings, or approve or promote people.
 - Upgrading from a version without roles: the first id in the old allowlist becomes admin,
   everyone else becomes member, and the old file is copied to `state.json.bak-preroles`.
-  `GROKBOT_ADMINS` ids are always admin; `GROKBOT_ALLOWLIST` ids are added as members
-  only if they don't already have a role (existing admins are never demoted).
+  Environment roles bootstrap missing users only: `GROKBOT_ADMINS` adds admins and
+  `GROKBOT_ALLOWLIST` adds members. Existing roles survive restarts; re-promote with
+  `/promote` or `approve.py`.
 - **Member messages leave your machine** for the chat model's provider (xAI by default),
   including photos they send. Pick a provider whose data terms you accept.
 - Each member reply is one paid API call. If `GROKBOT_MEMBER_LLM_API_KEY` is unset, members
@@ -206,26 +207,65 @@ Anyone with it can read your bot's updates and send as your bot. Revoke it in Bo
 - Webhook POSTs go over HTTPS to the Grok Bot service.
 - **Media is stored on disk** under `media/<update_id>/` and deleted after 7 days. Processes
   sharing the relay's UID, and accounts granted media access, can read it until then.
-  Transcripts are not stored by the relay, but they are part of the webhook body and
-  become part of the bot's run history.
+  Transcripts are stored in queued webhook events until delivery and are part of
+  the receiving bot's run history. Failed queue entries remain for operator review.
 - `state.json` holds Telegram user ids, usernames, first names, and pending codes. No
   secrets, but it is personal data.
 
+Supervisor PID files contain a PID and Linux process start time. Start, ensure, and
+stop verify the project supervisor command and working directory before trusting
+them. A private startup flock serializes launches.
+
+Webhook POSTs include `Idempotency-Key: telegram:<update_id>` and `update_id` in
+the body. The receiver MUST durably reject duplicate keys before starting any
+tool work, including retries after a lost HTTP acknowledgment. This bridge alone
+cannot guarantee exactly-once receiver actions.
+
+Production updates are fsynced to private `jobs/<update_id>.json` files before
+the polling offset advances. Prepared admin events are then fsynced to private
+`incoming/<update_id>.json` files before delivery. Failed delivery gets a visible Telegram reply
+and background retries (at most 10 batches of three attempts, or 24 hours). Final
+failures move to `incoming/failed/` with a final notice. The live queue is limited
+to 1000 events; a full incoming queue leaves work in jobs/ for retry. Pairing-only pauses queued
+delivery. Demoted users' queued events take the member chat path; removed users'
+events are discarded before retry.
+
 ## The outbox is trusted input
 
-The relay sends every valid `.json` file in `outbox/` to whatever `chat_id` it names. It
-doesn't check that the chat is one the bot was talking to. So **anyone who can write to the
-outbox folder can make your bot send any text to any chat it can reach**, including
-same-UID agents. File modes only help against other accounts; they do not restrict those
-agents. Keep outbox write access limited to trusted senders, including any separate bot
-account granted access as described above.
+Outbox destinations must be a previously seen inbound/outbound chat, an approved
+user id, or an id in `GROKBOT_OUTBOX_CHATS` (comma/space separated). Unknown
+chat ids move to `outbox/failed/`. Use the override for a first proactive message
+to a group the relay has not seen. Successful sends record the chat in state.json.
 
-## Not built yet
+Same-UID writers can still send arbitrary text to allowed chats and can modify
+state. Keep outbox write access limited to trusted senders; file modes restrict
+other accounts, not processes sharing the relay's UID.
 
-- **No rate limiting.** An approved person (or a stranger, for pairing replies) can send
-  as many messages as they like. Each admin message starts a run and each member message is
-  one paid chat-model call. Watch usage, and remove people who abuse it.
-- No per-chat allowlist, no content filtering, no audit log beyond `relay.log`.
+Outbox reads reject symlinks and non-regular files, cap JSON and text at 1 MiB,
+and claim entries under an exclusive drain lock. Interrupted work files are recovered
+on the next drain; regular files retain a short write grace period.
+
+Multipart outbox replies persist `sent_chars` after each acknowledged chunk and
+`next_attempt` after transient failures. Retries resume at that character offset.
+A crash or lost Telegram acknowledgment between a send and its progress write can
+still duplicate that chunk; Telegram sendMessage offers no idempotency key.
+
+## Resource bounds and remaining gaps
+
+- Heavy work runs outside polling, with two admin and two member slots by default
+  (`GROKBOT_ADMIN_WORKERS`, `GROKBOT_MEMBER_JOBS`). Admission is durable, keyed by
+  update id, and limited to 1000 pending jobs (each at most 1 MiB). Saturation holds
+  the polling offset. Failed jobs retry up to ten times, then move to `jobs/failed/`.
+- Member vision is capped at 4 MiB (`GROKBOT_VISION_MAX_BYTES`); larger photos get a
+  text-only fallback. History retains ten messages in at most 128 chats with LRU
+  eviction (`GROKBOT_MEMBER_HISTORY_CHATS`), and failed empty chats are not retained.
+- Media cleanup applies a seven-day TTL and a 512 MiB quota
+  (`GROKBOT_MEDIA_MAX_BYTES`), oldest first, once a minute and after worker jobs.
+  Active jobs are temporarily exempt. ASR's default response timeout is 90 seconds.
+- Pairing replies have a persisted 60-second cooldown per stranger. There are still
+  no per-user paid-call budgets or general per-chat rate limits. New stranger ids,
+  seen-chat state, logs, and failed queue directories can grow until operator cleanup.
+- No inbound per-chat allowlist, no content filtering, no audit log beyond `relay.log`.
 
 ## Reporting a vulnerability
 

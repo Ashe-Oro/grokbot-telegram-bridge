@@ -67,15 +67,38 @@ if [ -f "$SECRETS_FILE" ]; then
 fi
 PID="$DATA_DIR/relay.pid"
 LOG="$DATA_DIR/relay.log"
+. ./pidutil.sh
+relay_start_lock
+if [ "${1:-}" = "--pairing-only" ] || [ "${GROKBOT_PAIRING_ONLY:-0}" = 1 ]; then
+  export GROKBOT_PAIRING_ONLY=1
+  : > "$DATA_DIR/pairing-only"
+  chmod 600 "$DATA_DIR/pairing-only"
+else
+  export GROKBOT_PAIRING_ONLY=0
+  rm -f "$DATA_DIR/pairing-only"
+fi
 [ -n "${TELEGRAM_BOT_TOKEN:-}" ] || { echo "TELEGRAM_BOT_TOKEN not set"; exit 1; }
 if [ -z "${GROKBOT_WEBHOOK_URL:-}" ] || [ -z "${GROKBOT_WEBHOOK_KEY:-}" ]; then
-  if [ "${1:-}" != "--pairing-only" ]; then
+  if [ "$GROKBOT_PAIRING_ONLY" != 1 ]; then
     echo "GROKBOT_WEBHOOK_URL / GROKBOT_WEBHOOK_KEY not set. Use --pairing-only to run pairing without forwarding."; exit 1
   fi
 fi
-if [ -f "$PID" ] && kill -0 "$(cat "$PID")" 2>/dev/null; then echo "already running (pid $(cat "$PID"))"; exit 0; fi
+if relay_is_running "$PID"; then echo "already running (pid $pid)"; exit 0; fi
 python3 relay.py --check || exit 1
-setsid nohup ./supervise.sh >/dev/null 2>&1 < /dev/null &
-echo $! > "$PID"
-chmod 600 "$PID"
-echo "started pid $(cat "$PID"); log: $LOG"
+setsid nohup ./supervise.sh 9>&- >/dev/null 2>&1 < /dev/null &
+pid=$!
+for _ in {1..100}; do
+  started="$(relay_starttime "$pid")" || started=""
+  if [ -n "$started" ]; then
+    printf '%s\n%s\n' "$pid" "$started" > "$PID"
+    chmod 600 "$PID"
+    if relay_is_running "$PID"; then
+      echo "started pid $pid; log: $LOG"
+      exit 0
+    fi
+  fi
+  sleep 0.02
+done
+rm -f "$PID"
+echo "supervisor failed to start"
+exit 1

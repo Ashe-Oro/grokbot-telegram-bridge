@@ -12,8 +12,6 @@ from unittest.mock import patch
 FAKE_TOKEN = "123456789:FAKE_test_TOKEN_abcdefghijklmnopqrstu"
 FAKE_KEY = "fake-webhook-key-zzz"
 FAKE_LLM_KEY = "fake-member-llm-key-qqq"
-os.environ.update(TELEGRAM_BOT_TOKEN=FAKE_TOKEN, GROKBOT_WEBHOOK_KEY=FAKE_KEY,
-                  GROKBOT_WEBHOOK_URL="https://example.invalid/hook")
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import relay
@@ -33,7 +31,7 @@ def _make_fixtures():
     return d
 
 TD = _make_fixtures()
-relay.HOME = TD   # transcriber.err goes here, not into the repo
+unittest.addModuleCleanup(shutil.rmtree, TD, ignore_errors=True)
 
 def fixture(name):
     with open(os.path.join(TD, name), "rb") as f:
@@ -46,7 +44,27 @@ class FakeResp(io.BytesIO):
 
 class Base(unittest.TestCase):
     def setUp(self):
+        names = ("tg", "_open_file_url", "forward", "_post_chat", "MEMBER_THREADED",
+                 "BOT_NAME", "HOME", "STATE", "LOCK", "OUTBOX", "FAILED", "MEDIA",
+                 "MAX_FILE", "ASR_TIMEOUT", "TYPING_MAX", "MEMBER_HISTORY", "TYPING",
+                 "JOB_ACTIVE", "JOB_POOLS", "TRANSCRIBER")
+        original = {n: getattr(relay, n) for n in names}
+        self.original = original
+        self.addCleanup(lambda: [setattr(relay, n, v) for n, v in original.items()])
+        env = patch.dict(os.environ, TELEGRAM_BOT_TOKEN=FAKE_TOKEN, GROKBOT_WEBHOOK_KEY=FAKE_KEY,
+                         GROKBOT_WEBHOOK_URL="https://example.invalid/hook",
+                         GROKBOT_MEMBER_LLM_API_KEY=FAKE_LLM_KEY, MEMBER_LLM_API_KEY="",
+                         GROKBOT_ADMINS="", GROKBOT_ALLOWLIST="", GROKBOT_PAIRING_ONLY="0",
+                         GROKBOT_OUTBOX_CHATS="")
+        env.start(); self.addCleanup(env.stop)
+        relay.MEMBER_HISTORY = relay.collections.OrderedDict()
+        relay.TYPING = {}
+        relay.JOB_ACTIVE = set()
+        relay.JOB_POOLS = {}
+        relay.TRANSCRIBER = relay.Transcriber()
+        self.addCleanup(relay.TRANSCRIBER._kill)
         self.tmp = tempfile.mkdtemp()
+        relay.HOME = self.tmp
         for name, sub in (("STATE", "state.json"), ("LOCK", "state.lock"), ("OUTBOX", "outbox"), ("MEDIA", "media")):
             setattr(relay, name, os.path.join(self.tmp, sub))
         relay.FAILED = os.path.join(relay.OUTBOX, "failed")
@@ -95,6 +113,8 @@ class Base(unittest.TestCase):
         self.assertNotRegex(log, r"/bot[0-9]+:")
         for root, _, names in os.walk(self.tmp):
             for n in names:
+                if not os.path.isfile(os.path.join(root, n)) or os.path.islink(os.path.join(root, n)):
+                    continue
                 with open(os.path.join(root, n), "rb") as f:
                     b = f.read()
                 self.assertNotIn(FAKE_TOKEN.encode(), b, n); self.assertNotIn(FAKE_KEY.encode(), b, n)
@@ -143,6 +163,48 @@ class TestRoles(Base):
         self.assertEqual(relay.seed_allowlist("555", admins_raw="555"), 0)   # never demotes
         with relay.state(write=False) as s:
             self.assertEqual(s["roles"], {str(OWNER): "admin", "444": "member", "555": "admin"})
+
+    def test_demotion_during_media_routes_to_member(self):
+        def prepare(upd, msg, media, event):
+            with relay.state() as s:
+                s["roles"][str(OWNER)] = "member"
+            event["media_path"] = os.path.join(TD, "img.jpg")
+            return True
+        with patch.object(self.bot, "prepare_media", side_effect=prepare):
+            self.upd(390, {"photo": [{"file_id": "p"}]})
+        self.assertFalse(self.forwarded)
+        self.assertEqual(len(self.llm), 1)
+        self.assertFalse(relay.TYPING)
+
+    def test_removal_during_media_drops_message(self):
+        def prepare(upd, msg, media, event):
+            with relay.state() as s:
+                s["roles"].pop(str(OWNER))
+                s["allowlist"] = []
+            return True
+        with patch.object(self.bot, "prepare_media", side_effect=prepare):
+            self.upd(392, {"photo": [{"file_id": "p"}]})
+        self.assertFalse(self.forwarded)
+        self.assertFalse(self.llm)
+        self.assertFalse(relay.TYPING)
+
+    def test_command_actor_checked_in_transaction(self):
+        with relay.state() as s:
+            s["roles"][str(MEMBER)] = "member"
+            s["pending"]["ABC123"] = {"user_id": 555, "created": time.time()}
+        original = relay.set_role
+        def demote_then_set(*args, **kwargs):
+            with relay.state() as s:
+                s["roles"][str(OWNER)] = "member"
+            return original(*args, **kwargs)
+        with patch.object(relay, "set_role", side_effect=demote_then_set):
+            self.upd(391, {"text": f"/promote {MEMBER}"})
+        with self.assertRaises(PermissionError):
+            relay.approve_code("ABC123", actor=OWNER)
+        with relay.state(write=False) as s:
+            self.assertEqual(relay.role_of(s, MEMBER), "member")
+            self.assertIn("ABC123", s["pending"])
+        self.assertEqual(self.sends()[-1]["text"], relay.ADMIN_ONLY_REPLY)
 
     def test_admin_forwards_with_role(self):
         self.upd(40, {"text": "do a thing"})
@@ -486,6 +548,21 @@ class TestAllowlistSeed(Base):
         self.upd(40, {"text": "hi"}, user=333)      # GROKBOT_ALLOWLIST seeds members:
         self.assertFalse(self.forwarded); self.assertEqual(len(self.llm), 1)   # chat only
 
+    def test_seed_preserves_demoted_admin(self):
+        relay.seed_allowlist("", admins_raw="444")
+        self.assertTrue(relay.set_role(444, "member")[0])
+        self.assertEqual(relay.seed_allowlist("", admins_raw="444 555"), 1)
+        with relay.state(write=False) as s:
+            self.assertEqual(relay.role_of(s, 444), "member")
+            self.assertEqual(relay.role_of(s, 555), "admin")
+
+    @patch.dict(os.environ, GROKBOT_PAIRING_ONLY="1")
+    def test_pairing_only_disables_configured_webhook(self):
+        self.assertIsNone(relay.webhook_config())
+        self.upd(42, {"text": "hello"})
+        self.assertFalse(self.forwarded)
+        self.assertIn("isn't connected yet", self.sends()[0]["text"])
+
     def test_seed_rejects_garbage(self):
         with self.assertRaises(SystemExit):
             relay.parse_allowlist("123,@someone")
@@ -501,6 +578,7 @@ class TestAllowlistSeed(Base):
         self.assertEqual(self.sends()[0]["text"], "Helper isn't connected yet. Try again later.")
 
 class TestDotenv(unittest.TestCase):
+    @patch.dict(os.environ, TELEGRAM_BOT_TOKEN=FAKE_TOKEN)
     def test_dotenv_does_not_override(self):
         with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False) as f:
             f.write("# c\nexport BRIDGE_T1='one'\nBRIDGE_T2=\"two\"\nTELEGRAM_BOT_TOKEN=should-not-win\nbad line\n")
@@ -557,6 +635,261 @@ class TestVoice(Base):
             relay.ASR_TIMEOUT = old
         ev = self.forwarded[0]
         self.assertIsNone(ev["transcript"]); self.assertEqual(ev["transcript_error"], "timeout")
+
+class TestResourceBounds(Base):
+    def test_vision_byte_cap(self):
+        with relay.state() as s:
+            s["roles"][str(MEMBER)] = "member"
+        self.files = {"p": fixture("img.jpg")}
+        with patch.dict(os.environ, GROKBOT_VISION_MAX_BYTES="8"):
+            self.upd(901, {"photo": [{"file_id": "p"}]}, user=MEMBER)
+        content = self.llm[0][1]["messages"][-1]["content"]
+        self.assertIsInstance(content, str)
+        self.assertIn("photo I can't view", content)
+
+    def test_history_chat_eviction_and_failed_chats(self):
+        with patch.dict(os.environ, GROKBOT_MEMBER_HISTORY_CHATS="2"):
+            for chat in (1, 2, 1, 3):
+                relay.member_reply_text(chat, "A", "hi")
+            self.assertEqual(list(relay.MEMBER_HISTORY), [1, 3])
+            self.llm_fail = TimeoutError()
+            relay.member_reply_text(4, "A", "hi")
+        self.assertNotIn(4, relay.MEMBER_HISTORY)
+
+    def test_media_quota_removes_oldest(self):
+        for i in (1, 2, 3):
+            directory = os.path.join(relay.MEDIA, str(i))
+            os.mkdir(directory)
+            with open(os.path.join(directory, "file"), "wb") as f:
+                f.write(b"1234")
+            os.utime(directory, (time.time() - 10 + i, time.time() - 10 + i))
+        with patch.dict(os.environ, GROKBOT_MEDIA_MAX_BYTES="8"):
+            self.assertEqual(relay.cleanup_media(), 1)
+        self.assertEqual(sorted(os.listdir(relay.MEDIA)), ["2", "3"])
+
+    def test_pairing_reply_cooldown(self):
+        self.upd(902, {"text": "hi"}, user=STRANGER)
+        self.upd(903, {"text": "hi again"}, user=STRANGER)
+        self.assertEqual(len(self.sends()), 1)
+        self.assertIn("pairing cooldown", self.out.getvalue())
+        with patch.object(relay.time, "time", return_value=time.time() + 61):
+            self.upd(904, {"text": "later"}, user=STRANGER)
+        self.assertEqual(len(self.sends()), 2)
+        self.assertEqual(self.sends()[0]["text"], self.sends()[1]["text"])
+
+    def test_production_member_pool_is_bounded_and_deduplicated(self):
+        import threading
+        with relay.state() as s:
+            s["roles"][str(MEMBER)] = "member"
+        relay.MEMBER_THREADED = True
+        release = threading.Event()
+        two_started = threading.Event()
+        lock = threading.Lock()
+        counts = {"active": 0, "max": 0, "calls": 0}
+        def slow(cfg, payload):
+            with lock:
+                counts["active"] += 1
+                counts["calls"] += 1
+                counts["max"] = max(counts["max"], counts["active"])
+                if counts["active"] == 2:
+                    two_started.set()
+            release.wait(5)
+            with lock:
+                counts["active"] -= 1
+            return {"choices": [{"message": {"content": "ok"}}]}
+        threads = set()
+        with patch.object(relay, "_post_chat", side_effect=slow), \
+             patch.dict(os.environ, GROKBOT_MEMBER_JOBS="2"):
+            try:
+                for uid in range(910, 916):
+                    self.upd(uid, {"text": "hi"}, user=MEMBER)
+                self.upd(910, {"text": "duplicate"}, user=MEMBER)
+                self.assertTrue(two_started.wait(2))
+                self.assertEqual(counts["calls"], 2)
+                self.assertEqual(len(relay.JOB_ACTIVE), 2)
+                self.assertEqual(len([n for n in os.listdir(relay.jobs_dir()) if n.endswith(".json")]), 6)
+                release.set()
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    threads.update(t for t in threading.enumerate() if t.name.startswith("bridge-job-"))
+                    for t in list(threads):
+                        t.join(0.02)
+                    relay.dispatch_jobs(self.bot)
+                    if not relay.JOB_ACTIVE and counts["calls"] == 6:
+                        break
+                self.assertEqual(counts["calls"], 6)
+                self.assertLessEqual(counts["max"], 2)
+                self.assertFalse(relay.JOB_ACTIVE)
+                self.upd(910, {"text": "duplicate again"}, user=MEMBER)
+                self.assertEqual(counts["calls"], 6)
+            finally:
+                release.set()
+                for t in threading.enumerate():
+                    if t.name.startswith("bridge-job-"):
+                        t.join(5)
+
+class TestIncoming(Base):
+    def test_idempotency_header_and_durable_retry(self):
+        response = FakeResp(b"")
+        response.status = 200
+        with patch.object(relay, "forward", self.original["forward"]), \
+             patch.object(relay.urllib.request, "urlopen", side_effect=TimeoutError()) as post, \
+             patch.object(relay.time, "sleep"):
+            self.upd(801, {"text": "do something"})
+        self.assertEqual(post.call_count, 3)
+        request = post.call_args.args[0]
+        self.assertEqual(request.get_header("Idempotency-key"), "telegram:801")
+        self.assertEqual(json.loads(request.data)["update_id"], 801)
+        path = os.path.join(relay.HOME, "incoming", "801.json")
+        self.assertTrue(os.path.exists(path))
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        self.assertIn("saved and I'll retry", self.sends()[-1]["text"])
+        with patch.object(relay, "forward", self.original["forward"]), \
+             patch.object(relay.urllib.request, "urlopen", return_value=response) as post, \
+             patch.object(relay.time, "time", return_value=time.time() + 20):
+            relay.drain_incoming_once()
+        self.assertEqual(post.call_count, 1)
+        self.assertFalse(os.path.exists(path))
+
+    def test_invalid_webhook_url_is_queued_with_visible_error(self):
+        with patch.object(relay, "forward", self.original["forward"]), \
+             patch.object(relay.urllib.request, "Request", side_effect=ValueError("invalid")):
+            self.upd(806, {"text": "hi"})
+        self.assertTrue(os.path.exists(os.path.join(relay.HOME, "incoming", "806.json")))
+        self.assertIn("saved and I'll retry", self.sends()[-1]["text"])
+
+    def test_demoted_queued_event_uses_member_path(self):
+        with patch.object(relay, "forward", return_value=False):
+            self.upd(805, {"text": "hello"})
+        with relay.state() as s:
+            s["roles"][str(OWNER)] = "member"
+        with patch.object(relay.time, "time", return_value=time.time() + 20):
+            relay.drain_incoming_once()
+        self.assertFalse(self.forwarded)
+        self.assertEqual(len(self.llm), 1)
+        self.assertFalse(os.path.exists(os.path.join(relay.HOME, "incoming", "805.json")))
+
+    def test_queued_failure_can_advance_offset(self):
+        update = {"update_id": 804, "message": {"message_id": 7, "from": {"id": OWNER},
+                  "chat": {"id": OWNER, "type": "private"}, "text": "hello"}}
+        original = relay.tg
+        def polling(method, params=None, timeout=35):
+            if method == "getUpdates":
+                if params["offset"] == 0:
+                    return [update]
+                raise KeyboardInterrupt()
+            return original(method, params, timeout)
+        with patch.object(relay, "tg", side_effect=polling), \
+             patch.object(relay, "forward", return_value=False):
+            with self.assertRaises(KeyboardInterrupt):
+                self.bot.poll_forever()
+        with relay.state(write=False) as s:
+            self.assertEqual(s["offset"], 805)
+        self.assertTrue(os.path.exists(os.path.join(relay.HOME, "incoming", "804.json")))
+
+    def test_failed_handling_does_not_advance_offset(self):
+        with patch.object(self.bot, "handle", side_effect=OSError()), \
+             patch.object(relay, "tg", side_effect=[[{"update_id": 802}], KeyboardInterrupt()]), \
+             patch.object(relay.time, "sleep"):
+            with self.assertRaises(KeyboardInterrupt):
+                self.bot.poll_forever()
+        with relay.state(write=False) as s:
+            self.assertEqual(s["offset"], 0)
+
+    def test_exhausted_queue_moves_to_failed(self):
+        event = {"update_id": 803, "user_id": OWNER, "chat_id": OWNER}
+        with relay.incoming_lock() as directory:
+            path = os.path.join(directory, "803.json")
+            record = {"event": event, "created": time.time(), "attempts": 9, "next_attempt": 0}
+            relay.atomic_json(path, record)
+        with patch.object(relay, "forward", return_value=False):
+            relay.drain_incoming_once()
+        self.assertFalse(os.path.exists(path))
+        self.assertTrue(os.path.exists(os.path.join(directory, "failed", "803.json")))
+        self.assertIn("permanently", self.sends()[-1]["text"])
+
+class TestOutboxSafety(Base):
+    def entry(self, value, name="000.json"):
+        path = os.path.join(relay.OUTBOX, name)
+        with open(path, "w") as f:
+            json.dump(value, f)
+        os.utime(path, (1, 1))
+        return path
+
+    def test_fifo_and_symlink_do_not_block_or_follow(self):
+        import signal
+        fifo = os.path.join(relay.OUTBOX, "000.json")
+        os.mkfifo(fifo)
+        target = os.path.join(self.tmp, "target")
+        with open(target, "w") as f:
+            json.dump({"chat_id": OWNER, "text": "secret target"}, f)
+        os.symlink(target, os.path.join(relay.OUTBOX, "001.json"))
+        def timeout(*args):
+            raise AssertionError("outbox blocked")
+        old = signal.signal(signal.SIGALRM, timeout)
+        signal.alarm(2)
+        try:
+            relay.drain_outbox_once()
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old)
+        self.assertFalse(self.sends())
+        self.assertTrue(os.path.exists(target))
+        self.assertEqual(len(os.listdir(relay.FAILED)), 2)
+        os.unlink(os.path.join(relay.FAILED, "000.json"))  # leak scanner must not read a FIFO
+
+    def test_destination_authorization(self):
+        self.entry({"chat_id": -123, "text": "unknown"})
+        relay.drain_outbox_once()
+        self.assertFalse(self.sends())
+        self.assertTrue(os.path.exists(os.path.join(relay.FAILED, "000.json")))
+        relay.remember_chat(-124)
+        for i, chat in enumerate((-124, OWNER, -125)):
+            self.entry({"chat_id": chat, "text": "allowed"}, f"{i + 1}.json")
+        with patch.dict(os.environ, GROKBOT_OUTBOX_CHATS="-125, -126"):
+            relay.drain_outbox_once()
+        self.assertEqual([p["chat_id"] for p in self.sends()], [-124, OWNER, -125])
+        with relay.state(write=False) as s:
+            self.assertIn(-125, s["seen_chats"])
+
+    def test_invalid_retry_metadata_does_not_stall_other_entries(self):
+        self.entry({"chat_id": OWNER, "text": "bad", "next_attempt": "never"})
+        self.entry({"chat_id": OWNER, "text": "good"}, "001.json")
+        relay.drain_outbox_once()
+        self.assertEqual([p["text"] for p in self.sends()], ["good"])
+        self.assertTrue(os.path.exists(os.path.join(relay.FAILED, "000.json")))
+
+    def test_retry_resumes_after_successful_chunk(self):
+        for status in (429, 500):
+            with self.subTest(status=status):
+                self.calls.clear()
+                path = self.entry({"chat_id": OWNER, "text": "a" * 4096 + "tail"})
+                original = relay.tg
+                chunks = []
+                def flaky(method, params=None, timeout=35):
+                    if method == "sendMessage":
+                        chunks.append(params["text"])
+                        if len(chunks) == 2:
+                            raise relay.TgError(status, "retry", retry_after=7)
+                    return original(method, params, timeout)
+                with patch.object(relay, "tg", side_effect=flaky):
+                    relay.drain_outbox_once()
+                    work = path + ".work"
+                    with open(work) as f:
+                        saved = json.load(f)
+                    self.assertEqual(saved["sent_chars"], 4096)
+                    with patch.object(relay.time, "time", return_value=time.time() + 10):
+                        relay.drain_outbox_once()
+                self.assertEqual(chunks, ["a" * 4096, "tail", "tail"])
+                self.assertFalse(os.path.exists(work))
+
+    def test_oversize_rejected_small_entry_delivered(self):
+        path = self.entry({"chat_id": OWNER, "text": "x" * (relay.OUTBOX_MAX_BYTES + 1)})
+        self.entry({"chat_id": OWNER, "text": "small"}, "001.json")
+        relay.drain_outbox_once()
+        self.assertFalse(os.path.exists(path))
+        self.assertTrue(os.path.exists(os.path.join(relay.FAILED, "000.json")))
+        self.assertEqual([p["text"] for p in self.sends()], ["small"])
 
 class TestTyping(Base):
     def test_typing_starts_on_forward_and_stops_when_sent(self):

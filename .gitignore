@@ -10,6 +10,10 @@ state.json.tmp
 state.lock
 relay.log
 relay.pid
+relay.start.lock
+pairing-only
+incoming/
+jobs/
 transcriber.err
 outbox/
 media/

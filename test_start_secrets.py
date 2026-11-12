@@ -2,6 +2,9 @@
 """Offline tests for start.sh secrets-file loading. No network, no real secrets."""
 import os
 import subprocess
+import signal
+import shutil
+import time
 import tempfile
 import unittest
 from pathlib import Path
@@ -115,6 +118,13 @@ class TestStartSecrets(unittest.TestCase):
         for value in SENTINELS:
             self.assertNotIn(value, blob)
 
+    def test_pairing_mode_wiring(self):
+        self.assertIn("export GROKBOT_PAIRING_ONLY=1", START_SH.read_text())
+        self.assertIn('rm -f "$DATA_DIR/pairing-only"', START_SH.read_text())
+        self.assertIn('./start.sh --pairing-only', (ROOT / "ensure.sh").read_text())
+        self.assertIn('[ "${1:-}" = "--pairing-only" ]', (ROOT / "ensure.sh").read_text())
+        self.assertIn('python3 -u relay.py', (ROOT / "supervise.sh").read_text())
+
     def test_start_sh_has_expected_loader(self):
         block = secrets_block()
         self.assertIn(
@@ -203,6 +213,103 @@ class TestStartSecrets(unittest.TestCase):
         self.assertIn("token_set=no", proc.stdout)
         self.assertIn("token_match=no", proc.stdout)
         self.assertNotIn("warning:", proc.stdout + proc.stderr)
+
+
+class TestSupervisorIdentity(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        for name in ("start.sh", "stop.sh", "ensure.sh", "supervise.sh", "pidutil.sh"):
+            shutil.copy(ROOT / name, self.root / name)
+        self.data = self.root / "data"
+        self.data.mkdir()
+        binpath = self.root / "bin"
+        binpath.mkdir()
+        python = binpath / "python3"
+        python.write_text('#!/bin/bash\nif [ "${1:-}" = -u ]; then exec sleep 30; fi\nexit 1\n')
+        python.chmod(0o700)
+        self.env = dict(os.environ, GROKBOT_DATA_DIR=str(self.data),
+                        GROKBOT_SECRETS_FILE=str(self.root / "absent"),
+                        TELEGRAM_BOT_TOKEN=TOKEN, GROKBOT_WEBHOOK_URL=URL,
+                        GROKBOT_WEBHOOK_KEY=KEY, PATH=str(binpath) + ":" + os.environ["PATH"])
+
+    def run_script(self, name):
+        return subprocess.run(["bash", name], cwd=self.root, env=self.env,
+                              capture_output=True, text=True, timeout=5)
+
+    def write_pid(self, pid, start=None):
+        if start is None:
+            start = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]
+        (self.data / "relay.pid").write_text(f"{pid}\n{start}\n")
+
+    def test_foreign_live_pid_is_not_relay(self):
+        with subprocess.Popen(["sleep", "30"]) as sleeper:
+            try:
+                for script in ("start.sh", "ensure.sh", "stop.sh"):
+                    self.write_pid(sleeper.pid)
+                    result = self.run_script(script)
+                    self.assertNotIn("already running", result.stdout)
+                    self.assertNotIn("ok: running", result.stdout)
+                    self.assertIsNone(sleeper.poll())
+                self.assertIn("not running", result.stdout)
+                self.assertFalse((self.data / "relay.pid").exists())
+            finally:
+                sleeper.terminate()
+
+    def test_real_supervisor_and_starttime(self):
+        proc = subprocess.Popen(["bash", "./supervise.sh"], cwd=self.root,
+                                env=self.env, start_new_session=True,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            time.sleep(0.1)
+            self.write_pid(proc.pid)
+            self.assertIn("ok: running", self.run_script("ensure.sh").stdout)
+            self.assertIn("already running", self.run_script("start.sh").stdout)
+            self.write_pid(proc.pid, "1")
+            self.assertNotIn("ok: running", self.run_script("ensure.sh").stdout)
+        finally:
+            os.killpg(proc.pid, signal.SIGTERM)
+            proc.wait(timeout=5)
+
+    def test_supervisor_path_as_unrelated_argument_is_rejected(self):
+        proc = subprocess.Popen(["bash", "-c", "sleep 30 & wait", "./supervise.sh"],
+                                cwd=self.root, start_new_session=True)
+        try:
+            self.write_pid(proc.pid)
+            result = self.run_script("stop.sh")
+            self.assertIn("not running", result.stdout)
+            self.assertIsNone(proc.poll())
+        finally:
+            os.killpg(proc.pid, signal.SIGTERM)
+            proc.wait(timeout=5)
+
+    def test_concurrent_starts_launch_one_supervisor(self):
+        python = self.root / "bin" / "python3"
+        python.write_text('#!/bin/bash\nif [ "${1:-}" = -u ]; then exec sleep 30; fi\nexit 0\n')
+        processes = [subprocess.Popen(["bash", "start.sh"], cwd=self.root, env=self.env,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                     for _ in range(2)]
+        try:
+            output = [p.communicate(timeout=5)[0] for p in processes]
+            self.assertTrue(all(p.returncode == 0 for p in processes))
+            self.assertEqual(sum("started pid" in out for out in output), 1)
+            self.assertEqual(sum("already running" in out for out in output), 1)
+            lines = (self.data / "relay.pid").read_text().splitlines()
+            self.assertEqual(len(lines), 2)
+            for name in ("relay.pid", "relay.start.lock"):
+                self.assertEqual((self.data / name).stat().st_mode & 0o777, 0o600)
+        finally:
+            self.run_script("stop.sh")
+            for proc in processes:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait(timeout=5)
+
+    def test_startup_lock_wiring(self):
+        self.assertIn("relay_start_lock", START_SH.read_text())
+        self.assertIn('flock -x 9', (ROOT / "pidutil.sh").read_text())
+        self.assertIn('9>&-', START_SH.read_text())
 
 
 if __name__ == "__main__":

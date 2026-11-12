@@ -128,7 +128,7 @@ win over it. See [.env.example](../.env.example) for the full list:
 | `TELEGRAM_BOT_TOKEN` | yes | BotFather token |
 | `GROKBOT_WEBHOOK_URL` | to forward | The routine's webhook URL |
 | `GROKBOT_WEBHOOK_KEY` | to forward | Sent as `Authorization: Bearer <key>` |
-| `GROKBOT_ADMINS` | first admin | Telegram user ids that are admins (comma separated). The host puts their own id here to become the first admin |
+| `GROKBOT_ADMINS` | first admin | Bootstrap new admin user ids (comma separated); existing roles are never changed. The host puts their own id here to become the first admin |
 | `GROKBOT_ALLOWLIST` | no | Telegram user ids added as members from the start (comma separated) |
 | `GROKBOT_MEMBER_LLM_API_KEY` | for members | API key for the members' chat model. Unset: members get "I'm only set up to chat with admins right now." |
 | `GROKBOT_MEMBER_LLM_BASE_URL` | no | OpenAI-compatible base URL (default `https://api.x.ai/v1`) |
@@ -139,7 +139,7 @@ win over it. See [.env.example](../.env.example) for the full list:
 | `GROKBOT_DATA_DIR` | no | Where state, outbox, media, and logs live (default: this folder) |
 | `GROKBOT_ASR_PYTHON` | no | Python in the faster-whisper venv (default `./.venv-asr/bin/python`) |
 | `GROKBOT_ASR_MODEL` | no | `base.en` (default) or e.g. `small` for multilingual |
-| `GROKBOT_ASR_TIMEOUT` | no | Seconds per transcription (default 180) |
+| `GROKBOT_ASR_TIMEOUT` | no | Seconds per transcription (default 90) |
 | `GROKBOT_TYPING_MAX` | no | Seconds to keep refreshing Telegram's "typing..." while a reply is pending (default 180) |
 | `GROKBOT_SECRETS_FILE` | no | Path to a 0600 `export NAME=value` file that `start.sh` sources so secrets survive a reboot (default `/workspace/.secrets/grokbot-telegram.env`) |
 
@@ -181,11 +181,15 @@ The relay itself never needs pip. See [Photos and voice notes](#photos-and-voice
 ```bash
 python3 relay.py --check     # calls getMe; prints the bot's id, username, and privacy setting
 ./start.sh                   # starts the watchdog in the background; refuses to start without the webhook URL and key
-./start.sh --pairing-only    # runs without a webhook: pairing works, nothing is forwarded
+./start.sh --pairing-only    # disables webhook delivery even when URL/key are configured
 ./ensure.sh                  # start only if not already running (for cron or a keep-alive routine)
 ./stop.sh
 tail -f relay.log            # or $GROKBOT_DATA_DIR/relay.log if you set a data dir
 ```
+
+Pairing-only mode exports `GROKBOT_PAIRING_ONLY=1` and persists a private data-dir
+marker for `ensure.sh` restarts. Run `stop.sh`, then `start.sh` without the flag
+(and unset `GROKBOT_PAIRING_ONLY`) to clear it and enable forwarding.
 
 ### 6. Pair people
 
@@ -268,7 +272,9 @@ never reach the webhook), and for media `media_mime`,
 The relay only picks up files ending in `.json` that are at least half a second old, so a
 rename is atomic and a half-written reply is never sent. Text over 4096 characters is split
 into several messages. A malformed file, or one Telegram rejects with a 4xx, moves to
-`outbox/failed/`. On a 429, 5xx, or network error the file stays and is retried.
+`outbox/failed/`. On a 429, 5xx, or network error the claimed work file stays and is retried from
+the last acknowledged chunk; `retry_after` delays the next attempt. Outbox JSON
+and text are capped at 1 MiB; symlinks and non-regular files are rejected.
 
 ## Group behavior
 
@@ -300,7 +306,8 @@ into several messages. A malformed file, or one Telegram rejects with a 4xx, mov
   entirely: it decodes with `ffmpeg` to 16 kHz mono float32 and passes a numpy array.
 - **Size cap:** the Bot API won't let bots download files over 20 MB. Bigger files are
   refused with a friendly reply and never downloaded.
-- **Retention:** media folders older than 7 days are deleted at startup and every 6 hours.
+- **Retention:** cleanup runs once a minute and after worker jobs. Media older than
+  7 days is removed, then oldest media is removed until below the 512 MiB quota.
 - The bot shows "typing…" while it downloads and transcribes.
 - Stickers, video, edits, and other update types are ignored.
 
@@ -329,7 +336,7 @@ scheduled routine. Routines that need a login or an approval will still need you
 - Logs (`relay.log`) carry update ids, user ids, chat types, kinds, sizes, and errors. They
   never carry tokens, keys, message text, captions, or transcripts.
 - `start.sh` launches the supervisor in the background (via `setsid`) and writes its pid
-  to `relay.pid` under `GROKBOT_DATA_DIR` (default: this folder). If
+  and Linux start time to `relay.pid` under `GROKBOT_DATA_DIR` (default: this folder). If
   `GROKBOT_SECRETS_FILE` (default `/workspace/.secrets/grokbot-telegram.env`)
   exists, `start.sh` sources it after tightening the data directory, keeping
   any already-set non-empty environment values, and never
@@ -391,9 +398,38 @@ or key reached the logs or any file on disk.
   another way back, for example a small authenticated HTTPS endpoint on the relay that the
   bot POSTs replies to, or a synced folder. Neither is built, and you don't need it for
   the usual setup.
-- **No rate limiting.** See [SECURITY.md](../SECURITY.md).
+- Bounded workers and pairing cooldown; paid-call budgets and general per-chat rate limits remain unimplemented. See [SECURITY.md](../SECURITY.md).
 - **Single instance.** Run one relay per Telegram bot token. Two pollers on the same token
   will fight over updates.
+
+## Delivery and resource limits
+
+Outbox destinations must already be seen chats or approved user ids. For a first
+proactive message to an unseen group, add its chat id to `GROKBOT_OUTBOX_CHATS`
+(comma/space separated); unknown destinations move to `outbox/failed/`.
+
+Webhook POSTs include `Idempotency-Key: telegram:<update_id>` and `update_id` in
+the body. The receiver MUST durably reject duplicate keys before starting any
+tool work, including retries after a lost HTTP acknowledgment. This bridge alone
+cannot guarantee exactly-once receiver actions.
+
+Production updates are fsynced to `jobs/<update_id>.json` before the polling
+offset advances. Prepared admin events are fsynced to private
+`incoming/<update_id>.json` files before delivery. Failed delivery gets a visible Telegram reply
+and background retries (at most 10 batches of three attempts, or 24 hours). Final
+failures move to `incoming/failed/` with a final notice. The live queue is limited
+to 1000 events; a full incoming queue leaves work in jobs/ for retry. Pairing-only pauses queued
+delivery. Demoted users' queued events take the member chat path; removed users'
+events are discarded before retry.
+
+Production polling durably admits work to `jobs/` before advancing its offset.
+`GROKBOT_ADMIN_WORKERS` and `GROKBOT_MEMBER_JOBS` default to 2 each; up to 1000
+pending jobs wait on disk. `GROKBOT_VISION_MAX_BYTES` defaults to 4 MiB, with a
+text-only fallback above that size. `GROKBOT_MEMBER_HISTORY_CHATS` defaults to 128
+(LRU). `GROKBOT_MEDIA_MAX_BYTES` defaults to 512 MiB; cleanup removes oldest media
+in addition to the seven-day TTL. Stranger pairing replies have a 60-second cooldown.
+Failed jobs and webhook events need operator review and cleanup in their `failed/`
+subdirectories. Default `GROKBOT_ASR_TIMEOUT` is 90 seconds (overridable).
 
 ## Roadmap ideas
 
